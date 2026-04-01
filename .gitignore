@@ -1,0 +1,6 @@
+backup/
+pti_loader
+*.so
+*.folded
+*.svg
+*.txt
