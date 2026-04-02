@@ -77,9 +77,18 @@ std::string resolve_stack_to_string(void** callstack, int frames, const std::str
         char* paren = strchr(name, '(');
         if (paren) *paren = '\0';
 
-        if (strstr(name, "posix_signal_handler") || strstr(name, "get_stack_callback")) {
+        if (strstr(name, "posix_signal_handler") || 
+            strstr(name, "get_stack_callback") ||
+            strstr(name, "__restore_rt") || 
+            strstr(name, "backtrace")) {
             if (status == 0) free(demangled);
             continue; 
+        }
+
+        if (strstr(name, "resolve_stack_to_string")) {
+            if (status == 0) free(demangled);
+            free(strs);
+            return ""; 
         }
         
         if (!kernelName.empty() && kernelName == name) {
