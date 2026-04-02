@@ -1,26 +1,27 @@
 #include <cstdio>
 #include <cuda.h>
 #include <cupti.h>
-#include <execinfo.h>
+#include <cstdlib>
 #include <cxxabi.h>
+#include <cstring>
+#include <execinfo.h>
 #include <string>
-#include <unordered_map>
-#include <vector>
 #include <signal.h>
 #include <sys/time.h>
-#include <cstring>
+#include <unordered_map>
+#include <vector>
 
 extern "C" {
+    void SetToolEnv() {
+        setenv("PTI_ENABLE", "1", 1);
+    }
+
     void Usage() {
-        printf("CUDA Hybrid Profiler Loaded\n");
-        printf("Usage: PROFILER_FREQ=999 ./pti_loader <app> [args]\n");
+        printf("CUDA Hybrid Profiler (based on PTI)\n");
     }
 
     int ParseArgs(int argc, char* argv[]) {
-        return 1; 
-    }
-
-    void SetToolEnv() {
+        return 1;
     }
 }
 
@@ -34,7 +35,6 @@ struct RawSample {
 
 struct ProfilerConfig {
     int perf_freq = 999;
-    bool filter_cuda = false;
 };
 
 ProfilerConfig g_config;
@@ -143,19 +143,45 @@ void setup_cpu_timer() {
 
 __attribute__((constructor))
 void init_trace() {
-    if (const char* f = std::getenv("PROFILER_FREQ")) g_config.perf_freq = std::atoi(f);
-    if (const char* filter_env = std::getenv("PROFILER_FILTER")) g_config.filter_cuda = (std::string(filter_env) == "1");
+    const char* pti_env = std::getenv("PTI_ENABLE");
+    if (pti_env == nullptr || std::string(pti_env) != "1") {
+        return; 
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = posix_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART; 
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGALRM, &sa, NULL) == -1) {
+        perror("sigaction");
+        return;
+    }
+
+    if (const char* f = std::getenv("PROFILER_FREQ")) {
+        int freq = std::atoi(f);
+        if (freq > 0) g_config.perf_freq = freq;
+    }
 
     CUpti_SubscriberHandle subscriber;
-    cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)get_stack_callback, NULL);
-    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000);
+    CUptiResult res = cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)get_stack_callback, NULL);
+    if (res != CUPTI_SUCCESS) {
+        return;
+    }
+    
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API, 
+                        CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000);
 
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL);
+    
     auto alloc_buf = [](uint8_t **buf, size_t *size, size_t *maxNumRecords) {
-        *size = 64 * 1024; *buf = (uint8_t *)malloc(*size); *maxNumRecords = 0;
+        *size = 64 * 1024; 
+        *buf = (uint8_t *)malloc(*size); 
+        *maxNumRecords = 0;
     };
-    cuptiActivityRegisterCallbacks(alloc_buf, buffer_completed_callback);
 
+    cuptiActivityRegisterCallbacks(alloc_buf, buffer_completed_callback);
+    
     setup_cpu_timer();
 }
 
