@@ -29,7 +29,7 @@ g++ -o pti_loader loader/loader.cc -I./loader -I./utils -DTOOL_NAME=cupti_prof -
 
 ## Пример запуска
 
-Запустите профайлер на одном из собранных семплов:
+Запустите профайлер на одном из собранных семплов (напрмиер matrixMul):
 
 ```
 PROFILER_FREQ=999 ./pti_loader build/matrixMul > output.folded
@@ -51,4 +51,5 @@ git clone git@github.com:brendangregg/FlameGraph.git
 ../FlameGraph/./flamegraph.pl output.folded > output.svg
 ```
 
-Получился итоговый флейм граф `output.svg`
+Получился итоговый флейм граф `output.svg`:
+![flame graph](images/output.svg)
