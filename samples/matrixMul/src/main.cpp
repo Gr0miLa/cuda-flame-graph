@@ -7,7 +7,7 @@ std::vector<float> runMatrixMul(const std::vector<float>& a,
                                 const std::vector<float>& b, int size);
 
 int main() {
-    int size = 2048;
+    int size = 4096;
 
     std::vector<float> A(size * size);
     std::vector<float> B(size * size);

@@ -8,7 +8,7 @@ std::vector<float> runVectorAdd(const std::vector<float>& a,
 
 
 int main() {
-    int size = 5000000;
+    int size = 10000000;
 
     std::vector<float> A(size);
     std::vector<float> B(size);

@@ -1,8 +1,10 @@
 backup/
 build/
+
 *.so
 *.folded
 *.svg
-*.txt
+
+temp.cpp
 
 !images/output.svg
