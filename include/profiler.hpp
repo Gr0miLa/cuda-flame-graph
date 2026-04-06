@@ -1,15 +1,19 @@
 #ifndef CUDA_PROFILER_HPP
 #define CUDA_PROFILER_HPP
 
-#include <vector>
-#include <signal.h>
-#include <unordered_map>
-#include <string>
-#include <mutex>
+#include <atomic>
+#include <cstring>
 #include <cupti.h>
-#include <sys/time.h>
-#include <execinfo.h>
 #include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fstream>
+#include <mutex>
+#include <signal.h>
+#include <string>
+#include <sys/time.h>
+#include <unordered_map>
+#include <vector>
 
 const int MAX_STACK_DEPTH = 128;
 const int MAX_SAMPLES_COUNT = 50000;
@@ -17,6 +21,12 @@ const int MAX_SAMPLES_COUNT = 50000;
 struct RawSample {
     void* frames[MAX_STACK_DEPTH];
     int depth;
+};
+
+struct GpuSample {
+    void* frames[MAX_STACK_DEPTH];
+    int depth;
+    char kernel_name[128];
 };
 
 struct KernelRecord {
@@ -31,8 +41,17 @@ private:
     bool is_running = false;
 
     CUpti_SubscriberHandle subscriber;
+
+    KernelRecord kernel_activities[MAX_SAMPLES_COUNT];
+    std::atomic<int> kernel_activity_count{0};
+
     RawSample cpu_samples[MAX_SAMPLES_COUNT];
-    volatile int sample_count = 0;
+    std::atomic<int> cpu_sample_count{0};
+
+    GpuSample gpu_samples[MAX_SAMPLES_COUNT];
+    std::atomic<int> gpu_sample_count{0};
+    
+    std::unordered_map<void*, std::string> symbol_cache;
 
     CudaProfiler() = default;
     ~CudaProfiler() = default;
@@ -47,10 +66,6 @@ private:
     static void CUPTIAPI buffer_completed_callback(CUcontext ctx, uint32_t streamId, uint8_t* buffer, 
                                                    size_t size, size_t validSize);
     static void posix_signal_handler(int sig, siginfo_t* info, void* context);
-
-    std::unordered_map<uint32_t, RawSample> gpu_launch_stacks;
-    std::unordered_map<uint32_t, std::string> mangled_kernel_names;
-    std::vector<KernelRecord> kernel_activities;
 
 public:
     static CudaProfiler& instance();
