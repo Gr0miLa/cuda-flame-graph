@@ -18,6 +18,21 @@
 const int MAX_STACK_DEPTH = 128;
 const int MAX_SAMPLES_COUNT = 50000;
 
+enum class FrameCategory {
+    APP,
+    INTERNAL, 
+    SYSTEM, 
+    UNKNOWN, 
+    DEBUG 
+};
+
+struct FilterSettings {
+    bool show_internal = false;
+    bool show_system = false;
+    bool show_unknown = false;
+    bool show_debug = false;
+};
+
 struct RawSample {
     void* frames[MAX_STACK_DEPTH];
     int depth;
@@ -37,7 +52,7 @@ struct KernelRecord {
 class CudaProfiler {
 private:
     uint32_t frequency = 99;
-    bool filter_internals = true;
+    FilterSettings settings;
     bool is_running = false;
 
     CUpti_SubscriberHandle subscriber;
@@ -67,11 +82,13 @@ private:
                                                    size_t size, size_t validSize);
     static void posix_signal_handler(int sig, siginfo_t* info, void* context);
 
+    FrameCategory getFrameCategory(const std::string& name);
+
 public:
     static CudaProfiler& instance();
     
     void set_frequency(int freq);
-    void set_filter(bool enable);
+    void set_filter(FrameCategory category);
 
     void init();
     void finalize();

@@ -14,8 +14,52 @@ void CudaProfiler::set_frequency(int freq) {
     }
 }
 
-void CudaProfiler::set_filter(bool enable) {
-    filter_internals = enable;
+void CudaProfiler::set_filter(FrameCategory category) {
+    if (category == FrameCategory::INTERNAL) settings.show_internal = true;
+    if (category == FrameCategory::SYSTEM) settings.show_system = true;
+    if (category == FrameCategory::UNKNOWN) settings.show_unknown = true;
+}
+
+FrameCategory CudaProfiler::getFrameCategory(const std::string& name) {
+    if (name.empty()) return FrameCategory::APP;
+
+    if (name.find("posix_signal_handler") != std::string::npos || 
+        name.find("get_stack_callback") != std::string::npos ||
+        name.find("backtrace") != std::string::npos || 
+        name.find("resolve_stack_to_string") != std::string::npos) {
+        return FrameCategory::DEBUG;
+    }
+
+    if (name.find("CudaProfiler::") != std::string::npos || 
+        name.find("cupti") != std::string::npos || 
+        name.find("CUpti") != std::string::npos ||
+        name.find("init_trace") != std::string::npos ||
+        name.find("finalize_trace") != std::string::npos) {
+        return FrameCategory::INTERNAL;
+    }
+
+    if (name.find("_start") != std::string::npos || name.find("dlopen") != std::string::npos ||
+        name.find("__mmap") != std::string::npos || name.find("__sysconf") != std::string::npos ||
+        name.find("__default_morecore") != std::string::npos || name.find("get_nprocs") != std::string::npos ||
+        name.find("__strdup") != std::string::npos || name.find("__open64") != std::string::npos || 
+        name.find("__cudaRegister") != std::string::npos || name.find("cuDriverGetVersion") != std::string::npos ||
+        name.find("cuGetProcAddress") != std::string::npos || name.find("ioctl") != std::string::npos ||
+        name.find("D3DKMT") != std::string::npos || name.find("dxgdmal") != std::string::npos ||
+        name.find("__restore_rt") != std::string::npos || name.find("_IO_") != std::string::npos ||
+        name.find("getdelim") != std::string::npos || name.find("realpath") != std::string::npos ||
+        name.find("readlink") != std::string::npos || name.find("wcrtomb") != std::string::npos ||
+        name.find("__xstat64") != std::string::npos || name.find("dlsym") != std::string::npos ||
+        name.find("_dl_") != std::string::npos || name.find("pthread") != std::string::npos ||
+        name.find("__sched_get_priority_max") != std::string::npos ||
+        name.find("__libc") != std::string::npos) {
+        return FrameCategory::SYSTEM;
+    }
+
+    if (name.find("unknown") != std::string::npos) {
+        return FrameCategory::UNKNOWN;
+    }
+
+    return FrameCategory::APP;
 }
 
 void CudaProfiler::setup_cpu_timer() {
@@ -42,7 +86,11 @@ void CudaProfiler::setup_cpu_timer() {
 void CudaProfiler::init() {
     const char* pti_env = std::getenv("PTI_ENABLE");
     const char* freq_env = std::getenv("PTI_FREQ");
-    const char* show_env = std::getenv("PTI_SHOW");
+    const char* show_all_env = std::getenv("PTI_SHOW_ALL");
+    const char* show_debug_env = std::getenv("PTI_SHOW_DEBUG");
+    const char* show_internal_env = std::getenv("PTI_SHOW_INTERNAL");
+    const char* show_system_env = std::getenv("PTI_SHOW_SYSTEM");
+    const char* show_unknown_env = std::getenv("PTI_SHOW_UNKNOWN");
 
     if (pti_env == nullptr || std::string(pti_env) != "1") {
         return; 
@@ -50,9 +98,10 @@ void CudaProfiler::init() {
     if (freq_env) {
         frequency = std::atoi(freq_env);
     }
-    if (show_env) {
-        filter_internals = false;
-    }
+    if (show_all_env || show_internal_env) settings.show_internal = true;
+    if (show_all_env || show_system_env) settings.show_system = true;
+    if (show_unknown_env) settings.show_unknown = true;
+    if (show_debug_env) settings.show_debug = true;
 
     setup_cpu_timer();
 
@@ -87,21 +136,11 @@ void CudaProfiler::finalize() {
     for (int i = 0; i < gpu_total; ++i) {
         std::string kName = clean_name(gpu_samples[i].kernel_name);
         std::string path = resolve_stack_to_string(gpu_samples[i].frames, gpu_samples[i].depth, kName);
-        // printf("%s%s %lu\n", path.c_str(), kName.c_str(), (unsigned long)kernel_activities[i].duration);
         if (!path.empty()) {
             if (path.back() == ';') path.pop_back();
             aggregated[path] += kernel_activities[i].duration;
         }
     }
-
-    // for (const auto& rec : kernel_activities) {
-    //     if (gpu_launch_stacks.count(rec.correlationId)) {
-    //         std::string kName = clean_name(mangled_kernel_names[rec.correlationId].c_str());
-    //         std::string path = resolve_stack_to_string(gpu_launch_stacks[rec.correlationId].frames, 
-    //                                                    gpu_launch_stacks[rec.correlationId].depth, kName);
-    //         printf("%s%s %lu\n", path.c_str(), kName.c_str(), (unsigned long)rec.duration);
-    //     }
-    // }
 
     int cpu_total = std::min((int)cpu_sample_count, MAX_SAMPLES_COUNT);
     for (int i = 0; i < cpu_total; ++i) {
@@ -133,19 +172,6 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
     bool show_debug = (std::getenv("PTI_DEBUG") != nullptr);
 
     for (int i = frames - 1; i >= 0; --i) {
-        // char* begin_name = strchr(strs[i], '(');
-        // char* begin_offset = strchr(strs[i], '+');
-        // if (!begin_name || !begin_offset || begin_name >= begin_offset) continue;
-
-        // *begin_name++ = '\0';
-        // *begin_offset = '\0';
-
-        // int status;
-        // char* demangled = abi::__cxa_demangle(begin_name, NULL, NULL, &status);
-        // char* name = (status == 0) ? demangled : begin_name;
-        // char* paren = strchr(name, '(');
-        // if (paren) *paren = '\0';
-
         void* addr = callstack[i];
 
         if (symbol_cache.find(addr) == symbol_cache.end()) {
@@ -175,26 +201,13 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
         }
 
         const std::string& name = symbol_cache[addr];
+        FrameCategory category = getFrameCategory(name);
 
-        if (name == "unknown") continue;
+        if (category == FrameCategory::INTERNAL && !settings.show_internal) continue;
+        if (category == FrameCategory::SYSTEM && !settings.show_system) continue;
+        if (category == FrameCategory::UNKNOWN && !settings.show_unknown) continue;
+        if (category == FrameCategory::DEBUG && !settings.show_debug) continue;
 
-        if (!show_debug) {
-            if (name.find("posix_signal_handler") != std::string::npos || 
-                name.find("get_stack_callback") != std::string::npos ||
-                name.find("__restore_rt") != std::string::npos || 
-                name.find("backtrace") != std::string::npos || 
-                name.find("resolve_stack_to_string") != std::string::npos) {
-                continue;
-            }
-        }
-
-        bool is_profiler_logic = (name.find("CudaProfiler::") != std::string::npos || 
-                                  name.find("cupti") != std::string::npos ||
-                                  name.find("CUpti") != std::string::npos ||
-                                  name.find("init_trace") != std::string::npos ||
-                                  name.find("finalize_trace") != std::string::npos);
-
-        if (is_profiler_logic && filter_internals) continue;
         if (!kernelName.empty() && kernelName == name) continue;
 
         if (!name.empty()) {
@@ -202,7 +215,7 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
         }
     }
     if (!kernelName.empty()) {
-        full_path += "[GPU] " + kernelName;
+        full_path += "[compute] " + kernelName;
     } else {
         if (!full_path.empty() && full_path.back() == ';') {
             full_path.pop_back();
@@ -213,7 +226,6 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
 
 void CudaProfiler::posix_signal_handler(int sig, siginfo_t* info, void* context) {
     auto& self = instance();
-    // int idx = __sync_fetch_and_add(&self.cpu_sample_count, 1);
     int idx = self.cpu_sample_count.fetch_add(1);
     if (idx < MAX_SAMPLES_COUNT) {
         self.cpu_samples[idx].depth = backtrace(self.cpu_samples[idx].frames, MAX_STACK_DEPTH);
@@ -226,17 +238,12 @@ void CudaProfiler::get_stack_callback(void* userdata, CUpti_CallbackDomain domai
         cbInfo->callbackSite != CUPTI_API_ENTER) return;
 
     auto& self = instance();
-    // RawSample s;
-    // s.depth = backtrace(s.frames, MAX_STACK_DEPTH);
     int idx = self.gpu_sample_count.fetch_add(1);
     if (idx < MAX_SAMPLES_COUNT) {
         self.gpu_samples[idx].depth = backtrace(self.gpu_samples[idx].frames, MAX_STACK_DEPTH);
         strncpy(self.gpu_samples[idx].kernel_name, cbInfo->symbolName, 127);
         self.gpu_samples[idx].kernel_name[127] = '\0';
     }
-
-    // self.gpu_launch_stacks[cbInfo->correlationId] = s;
-    // self.mangled_kernel_names[cbInfo->correlationId] = cbInfo->symbolName;
 }
 
 void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, uint8_t* buffer, 
@@ -246,7 +253,6 @@ void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, u
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
         if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
             auto *k = (CUpti_ActivityKernel4 *)record;
-            // self.kernel_activities.push_back({k->correlationId, k->end - k->start});
             int idx = self.kernel_activity_count.fetch_add(1);
             if (idx < MAX_SAMPLES_COUNT) {
                 self.kernel_activities[idx] = {k->correlationId, (uint64_t)(k->end - k->start)};
