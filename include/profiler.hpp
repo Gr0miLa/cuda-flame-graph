@@ -20,10 +20,11 @@ const int MAX_SAMPLES_COUNT = 50000;
 
 enum class FrameCategory {
     APP,
-    INTERNAL, 
-    SYSTEM, 
-    UNKNOWN, 
-    DEBUG 
+    CUDA,      // Драйвер, рантайма и всё, что связано с NVIDIA
+    SYSTEM,    // libc, ld, pthread и прочая системная обвязка
+    INTERNAL,  // Твой профайлер
+    UNKNOWN,   // Если совсем ничего не понятно
+    DEBUG      // Сигналы и отладка
 };
 
 struct FilterSettings {
@@ -31,6 +32,7 @@ struct FilterSettings {
     bool show_system = false;
     bool show_unknown = false;
     bool show_debug = false;
+    bool show_cuda = false;
 };
 
 struct RawSample {
@@ -47,6 +49,11 @@ struct GpuSample {
 struct KernelRecord {
     uint32_t correlationId;
     uint64_t duration;
+};
+
+struct CachedFrame {
+    std::string name;
+    FrameCategory category;
 };
 
 class CudaProfiler {
@@ -66,7 +73,7 @@ private:
     GpuSample gpu_samples[MAX_SAMPLES_COUNT];
     std::atomic<int> gpu_sample_count{0};
     
-    std::unordered_map<void*, std::string> symbol_cache;
+    std::unordered_map<void*, CachedFrame> symbol_cache;
 
     CudaProfiler() = default;
     ~CudaProfiler() = default;
@@ -95,4 +102,4 @@ public:
 
 };
 
-#endif // CUDA_PROFILER_HPP
+#endif  // CUDA_PROFILER_HPP

@@ -20,48 +20,6 @@ void CudaProfiler::set_filter(FrameCategory category) {
     if (category == FrameCategory::UNKNOWN) settings.show_unknown = true;
 }
 
-FrameCategory CudaProfiler::getFrameCategory(const std::string& name) {
-    if (name.empty()) return FrameCategory::APP;
-
-    if (name.find("posix_signal_handler") != std::string::npos || 
-        name.find("get_stack_callback") != std::string::npos ||
-        name.find("backtrace") != std::string::npos || 
-        name.find("resolve_stack_to_string") != std::string::npos) {
-        return FrameCategory::DEBUG;
-    }
-
-    if (name.find("CudaProfiler::") != std::string::npos || 
-        name.find("cupti") != std::string::npos || 
-        name.find("CUpti") != std::string::npos ||
-        name.find("init_trace") != std::string::npos ||
-        name.find("finalize_trace") != std::string::npos) {
-        return FrameCategory::INTERNAL;
-    }
-
-    if (name.find("_start") != std::string::npos || name.find("dlopen") != std::string::npos ||
-        name.find("__mmap") != std::string::npos || name.find("__sysconf") != std::string::npos ||
-        name.find("__default_morecore") != std::string::npos || name.find("get_nprocs") != std::string::npos ||
-        name.find("__strdup") != std::string::npos || name.find("__open64") != std::string::npos || 
-        name.find("__cudaRegister") != std::string::npos || name.find("cuDriverGetVersion") != std::string::npos ||
-        name.find("cuGetProcAddress") != std::string::npos || name.find("ioctl") != std::string::npos ||
-        name.find("D3DKMT") != std::string::npos || name.find("dxgdmal") != std::string::npos ||
-        name.find("__restore_rt") != std::string::npos || name.find("_IO_") != std::string::npos ||
-        name.find("getdelim") != std::string::npos || name.find("realpath") != std::string::npos ||
-        name.find("readlink") != std::string::npos || name.find("wcrtomb") != std::string::npos ||
-        name.find("__xstat64") != std::string::npos || name.find("dlsym") != std::string::npos ||
-        name.find("_dl_") != std::string::npos || name.find("pthread") != std::string::npos ||
-        name.find("__sched_get_priority_max") != std::string::npos ||
-        name.find("__libc") != std::string::npos) {
-        return FrameCategory::SYSTEM;
-    }
-
-    if (name.find("unknown") != std::string::npos) {
-        return FrameCategory::UNKNOWN;
-    }
-
-    return FrameCategory::APP;
-}
-
 void CudaProfiler::setup_cpu_timer() {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -90,6 +48,7 @@ void CudaProfiler::init() {
     const char* show_debug_env = std::getenv("PTI_SHOW_DEBUG");
     const char* show_internal_env = std::getenv("PTI_SHOW_INTERNAL");
     const char* show_system_env = std::getenv("PTI_SHOW_SYSTEM");
+    const char* show_cuda_env = std::getenv("PTI_SHOW_CUDA");
     const char* show_unknown_env = std::getenv("PTI_SHOW_UNKNOWN");
 
     if (pti_env == nullptr || std::string(pti_env) != "1") {
@@ -100,6 +59,7 @@ void CudaProfiler::init() {
     }
     if (show_all_env || show_internal_env) settings.show_internal = true;
     if (show_all_env || show_system_env) settings.show_system = true;
+    if (show_all_env || show_cuda_env) settings.show_cuda = true;
     if (show_unknown_env) settings.show_unknown = true;
     if (show_debug_env) settings.show_debug = true;
 
@@ -157,17 +117,60 @@ void CudaProfiler::finalize() {
 }
 
 std::string CudaProfiler::clean_name(const char* mangled_name) {
+    if (!mangled_name) return "unknown";
+    
     int status;
     char* demangled = abi::__cxa_demangle(mangled_name, NULL, NULL, &status);
     std::string name = (status == 0) ? demangled : mangled_name;
     if (status == 0) free(demangled);
+    
     size_t paren = name.find('(');
     if (paren != std::string::npos) name = name.substr(0, paren);
+    
     return name;
 }
 
+FrameCategory CudaProfiler::getFrameCategory(const std::string& name) {
+    if (name.empty()) return FrameCategory::APP;
+
+    if (name.find("posix_signal_handler") != std::string::npos || 
+        name.find("get_stack_callback") != std::string::npos ||
+        name.find("backtrace") != std::string::npos || 
+        name.find("resolve_stack_to_string") != std::string::npos) {
+        return FrameCategory::DEBUG;
+    }
+
+    if (name.find("CudaProfiler::") != std::string::npos || 
+        name.find("cupti") != std::string::npos || 
+        name.find("CUpti") != std::string::npos ||
+        name.find("init_trace") != std::string::npos ||
+        name.find("finalize_trace") != std::string::npos) {
+        return FrameCategory::INTERNAL;
+    }
+
+    if (name.find("cuDriver") != std::string::npos || 
+        name.find("cuDevice") != std::string::npos ||
+        name.find("nvaci") != std::string::npos ||
+        name.find("libcuda") != std::string::npos) {
+        return FrameCategory::CUDA;
+    }
+
+    if (name.find("__libc") != std::string::npos || 
+        name.find("pthread") != std::string::npos || 
+        name.find("_dl_") != std::string::npos ||
+        name.find("_IO_") != std::string::npos ||
+        name.find("ioctl") != std::string::npos ||
+        name.find("D3DKMT") != std::string::npos ||
+        name.find("_start") != std::string::npos) {
+        return FrameCategory::SYSTEM;
+    }
+
+    if (name.find("unknown") != std::string::npos) return FrameCategory::UNKNOWN;
+
+    return FrameCategory::APP;
+}
+
 std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, const std::string& kernelName) {
-    // char** strs = backtrace_symbols(callstack, frames);
     std::string full_path = "";
     bool show_debug = (std::getenv("PTI_DEBUG") != nullptr);
 
@@ -177,50 +180,59 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
         if (symbol_cache.find(addr) == symbol_cache.end()) {
             Dl_info info;
             if (dladdr(addr, &info) && info.dli_sname) {
-                int status;
-                std::string name;
+                std::string name = clean_name(info.dli_sname);
+                symbol_cache[addr] = { name, getFrameCategory(name) };
+            } 
+            else if (info.dli_fname) {
+                std::string fname = info.dli_fname;
+                size_t last_slash = fname.find_last_of('/');
+                if (last_slash != std::string::npos) fname = fname.substr(last_slash + 1);
 
-                char* demangled = abi::__cxa_demangle(info.dli_sname, NULL, NULL, &status);
+                uintptr_t offset = (uintptr_t)addr - (uintptr_t)info.dli_fbase;
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer), "%s[+0x%lx]", fname.c_str(), offset);
 
-                if (status == 0) {
-                    name = demangled;
-                    free(demangled);
-                } else {
-                    name = info.dli_sname;
+                // Автоматическое определение категории по имени файла
+                FrameCategory cat = FrameCategory::UNKNOWN;
+                std::string s_name = buffer;
+                
+                if (s_name.find("libcuda") != std::string::npos || 
+                    s_name.find("nvaci") != std::string::npos ||
+                    s_name.find("cudart") != std::string::npos) {
+                    cat = FrameCategory::CUDA;
+                } else if (s_name.find("libc.so") != std::string::npos || 
+                           s_name.find("pthread") != std::string::npos) {
+                    cat = FrameCategory::SYSTEM;
                 }
 
-                size_t paren = name.find('(');
-                if (paren != std::string::npos) {
-                    name = name.substr(0, paren);
-                }
-
-                symbol_cache[addr] = name;
-            } else {
-                symbol_cache[addr] = "unknown";
+                symbol_cache[addr] = { s_name, cat };
+            } 
+            else {
+                symbol_cache[addr] = { "unknown", FrameCategory::UNKNOWN };
             }
         }
 
-        const std::string& name = symbol_cache[addr];
-        FrameCategory category = getFrameCategory(name);
+        const CachedFrame& frame = symbol_cache[addr];
 
-        if (category == FrameCategory::INTERNAL && !settings.show_internal) continue;
-        if (category == FrameCategory::SYSTEM && !settings.show_system) continue;
-        if (category == FrameCategory::UNKNOWN && !settings.show_unknown) continue;
-        if (category == FrameCategory::DEBUG && !settings.show_debug) continue;
+        if (frame.category == FrameCategory::INTERNAL && !settings.show_internal) continue;
+        if (frame.category == FrameCategory::SYSTEM && !settings.show_system) continue;
+        if (frame.category == FrameCategory::CUDA && !settings.show_cuda) continue;
+        if (frame.category == FrameCategory::UNKNOWN && !settings.show_unknown) continue;
+        if (frame.category == FrameCategory::DEBUG && !show_debug) continue;
 
-        if (!kernelName.empty() && kernelName == name) continue;
+        if (!kernelName.empty() && kernelName == frame.name) continue;
 
-        if (!name.empty()) {
-            full_path += std::string(name) + ";";
+        if (!frame.name.empty()) {
+            full_path += frame.name + ";";
         }
     }
+
     if (!kernelName.empty()) {
         full_path += "[compute] " + kernelName;
-    } else {
-        if (!full_path.empty() && full_path.back() == ';') {
-            full_path.pop_back();
-        }
+    } else if (!full_path.empty() && full_path.back() == ';') {
+        full_path.pop_back();
     }
+
     return full_path;
 }
 

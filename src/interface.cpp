@@ -62,6 +62,9 @@ extern "C" {
             } else if (strcmp(arg, "-u") == 0 || strcmp(arg, "--show-unknown") == 0) {
                 setenv("PTI_SHOW_UNKNOWN", "1", 1);
                 i += 1;
+            } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--show-cuda") == 0) {
+                setenv("PTI_SHOW_CUDA", "1", 1);
+                i += 1;
             } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--show-all") == 0) {
                 setenv("PTI_SHOW_ALL", "1", 1);
                 i += 1;
