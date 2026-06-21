@@ -23,11 +23,15 @@ extern "C" {
         printf("CUDA C++ Profiler Loader\n");
         printf("Usage: ./pti_loader [options] <application> [args]\n\n");
         printf("Options:\n");
-        printf("  -f, --freq <value>    Set sampling frequency in Hz (default: 99)\n");
-        printf("  -s, --show-all        Show profiler internal overhead (disabled by default)\n");
-        printf("  -h, --help            Show this help message and exit\n");
+        printf("  -f, --freq <value>        Set sampling frequency in Hz (default: 99)\n");
+        printf("  -i, --show-internal       Show profiler internal overhead\n");
+        printf("  -s, --show-system         Show system functions\n");
+        printf("  -c, --show-cuda           Show libcuda functions\n");
+        printf("  -u, --show-unknown        Show unknown functions\n");
+        printf("  -a, --show-all            Show all functions\n");
+        printf("  -h, --help                Show this help message and exit\n");
         printf("\nExample:\n");
-        printf("  ./pti_loader -f 1000 ./my_cuda_app\n");
+        printf("  ./pti_loader -f 999 ./my_cuda_app\n");
     }
 
     int ParseArgs(int argc, char* argv[]) {

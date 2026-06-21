@@ -20,11 +20,11 @@ const int MAX_SAMPLES_COUNT = 50000;
 
 enum class FrameCategory {
     APP,
-    CUDA,      // Драйвер, рантайма и всё, что связано с NVIDIA
-    SYSTEM,    // libc, ld, pthread и прочая системная обвязка
-    INTERNAL,  // Твой профайлер
-    UNKNOWN,   // Если совсем ничего не понятно
-    DEBUG      // Сигналы и отладка
+    CUDA,
+    SYSTEM,
+    INTERNAL,
+    UNKNOWN,
+    DEBUG
 };
 
 struct FilterSettings {
