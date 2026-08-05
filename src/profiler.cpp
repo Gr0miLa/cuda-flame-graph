@@ -3,6 +3,45 @@
 #include <algorithm>
 #include <cstring>
 
+struct CategoryRule {
+    const char* substr;
+    FrameCategory category;
+};
+
+static const CategoryRule kCategoryRules[] = {
+    {"posix_signal_handler",    FrameCategory::DEBUG},
+    {"get_stack_callback",      FrameCategory::DEBUG},
+    {"backtrace",               FrameCategory::DEBUG},
+    {"resolve_stack_to_string", FrameCategory::DEBUG},
+    {"CudaProfiler::",          FrameCategory::INTERNAL},
+    {"cupti",                   FrameCategory::INTERNAL},
+    {"CUpti",                   FrameCategory::INTERNAL},
+    {"init_trace",              FrameCategory::INTERNAL},
+    {"finalize_trace",          FrameCategory::INTERNAL},
+    
+    {"cudaMemcpy",              FrameCategory::CUDA_API},
+    {"cudaMalloc",              FrameCategory::CUDA_API},
+    {"cudaFree",                FrameCategory::CUDA_API},
+    {"cudaLaunchKernel",        FrameCategory::CUDA_API},
+    
+    {"libcuda",                 FrameCategory::CUDA_DRIVER},
+    {"libcudart",               FrameCategory::CUDA_RUNTIME},
+    {"cudart",                  FrameCategory::CUDA_RUNTIME},
+    
+    {"cuDriver",                FrameCategory::CUDA_DRIVER},
+    {"cuDevice",                FrameCategory::CUDA_DRIVER},
+    {"nvaci",                   FrameCategory::CUDA_DRIVER},
+    
+    {"__libc",                  FrameCategory::SYSTEM},
+    {"pthread",                 FrameCategory::SYSTEM},
+    {"_dl_",                    FrameCategory::SYSTEM},
+    {"_IO_",                    FrameCategory::SYSTEM},
+    {"ioctl",                   FrameCategory::SYSTEM},
+    {"D3DKMT",                  FrameCategory::SYSTEM},
+    {"_start",                  FrameCategory::SYSTEM},
+    {"unknown",                 FrameCategory::UNKNOWN}
+};
+
 CudaProfiler& CudaProfiler::instance() {
     static CudaProfiler inst;
     return inst;
@@ -14,63 +53,112 @@ void CudaProfiler::set_frequency(int freq) {
     }
 }
 
-void CudaProfiler::set_filter(FrameCategory category) {
-    if (category == FrameCategory::INTERNAL) settings.show_internal = true;
-    if (category == FrameCategory::SYSTEM) settings.show_system = true;
-    if (category == FrameCategory::UNKNOWN) settings.show_unknown = true;
+static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
+                            int cpu, int group_fd, unsigned long flags) {
+    return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
-void CudaProfiler::setup_cpu_timer() {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = posix_signal_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigfillset(&sa.sa_mask);
-    sigaction(SIGALRM, &sa, NULL);
+void CudaProfiler::setup_perf_events() {
+    struct perf_event_attr pe;
+    memset(&pe, 0, sizeof(struct perf_event_attr));
 
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGALRM);
-    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    pe.type = PERF_TYPE_SOFTWARE;
+    pe.size = sizeof(struct perf_event_attr);
+    pe.config = PERF_COUNT_SW_CPU_CLOCK;
+    pe.sample_freq = frequency;
+    pe.freq = 1;
+    
+    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_CALLCHAIN;
+    pe.exclude_idle = 1;
+    pe.disabled = 1;
 
-    struct itimerval timer;
-    long interval_us = 1000000 / frequency;
-    timer.it_interval.tv_sec = 0;
-    timer.it_interval.tv_usec = (interval_us > 0) ? interval_us : 1;
-    timer.it_value = timer.it_interval;
-    setitimer(ITIMER_REAL, &timer, NULL);
+    perf_fd = perf_event_open(&pe, 0, -1, -1, 0);
+    if (perf_fd == -1) {
+        fprintf(stderr, "Error opening perf event. Run with root privileges or set perf_event_paranoid to -1.\n");
+        return;
+    }
+
+    // Выделение памяти под кольцевой буфер ядра: 1 страница метаданных + 8 страниц для самих сэмплов
+    size_t page_size = getpagesize();
+    size_t mmap_size = page_size * (1 + 8);
+    
+    void* base = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, perf_fd, 0);
+    if (base == MAP_FAILED) {
+        fprintf(stderr, "Error mmaping perf buffer\n");
+        close(perf_fd);
+        perf_fd = -1;
+        perf_page = nullptr;
+        return;
+    }
+
+    perf_page = static_cast<struct perf_event_mmap_page*>(base);
+
+    ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0);
 }
 
 void CudaProfiler::init() {
     const char* pti_env = std::getenv("PTI_ENABLE");
-    const char* freq_env = std::getenv("PTI_FREQ");
-    const char* show_all_env = std::getenv("PTI_SHOW_ALL");
-    const char* show_debug_env = std::getenv("PTI_SHOW_DEBUG");
-    const char* show_internal_env = std::getenv("PTI_SHOW_INTERNAL");
-    const char* show_system_env = std::getenv("PTI_SHOW_SYSTEM");
-    const char* show_cuda_env = std::getenv("PTI_SHOW_CUDA");
-    const char* show_unknown_env = std::getenv("PTI_SHOW_UNKNOWN");
-
     if (pti_env == nullptr || std::string(pti_env) != "1") {
         return; 
     }
-    if (freq_env) {
-        frequency = std::atoi(freq_env);
+    
+    if (const char* freq_env = std::getenv("PTI_FREQ")) {
+        int freq = std::atoi(freq_env);
+        if (freq <= 0 || freq > 10000) {
+            fprintf(stderr, "Warning: Invalid frequency %d. Using default 99 Hz\n", freq);
+            frequency = 99;
+        } else {
+            frequency = freq;
+        }
     }
-    if (show_all_env || show_internal_env) settings.show_internal = true;
-    if (show_all_env || show_system_env) settings.show_system = true;
-    if (show_all_env || show_cuda_env) settings.show_cuda = true;
-    if (show_unknown_env) settings.show_unknown = true;
-    if (show_debug_env) settings.show_debug = true;
 
-    setup_cpu_timer();
+    uint32_t mask = FLAG_DEFAULT;
+    if (const char* profile = std::getenv("PTI_PROFILE")) {
+        std::string prof(profile);
+        if (prof == "minimal") {
+            mask = FLAG_APP | FLAG_CUDA_API;
+        } else if (prof == "standard") {
+            mask = FLAG_APP | FLAG_CUDA_API | FLAG_SYSTEM;
+        } else if (prof == "full") {
+            mask = FLAG_APP | FLAG_CUDA_ALL | FLAG_SYSTEM | FLAG_UNKNOWN;
+        } else if (prof == "debug") {
+            mask = 0xFFFFFFFF;
+        }
+    } else {
+        if (std::getenv("PTI_SHOW_ALL")) mask = 0xFFFFFFFF;
+        if (std::getenv("PTI_SHOW_SYSTEM")) mask |= FLAG_SYSTEM;
+        if (std::getenv("PTI_SHOW_INTERNAL")) mask |= FLAG_INTERNAL;
+        if (std::getenv("PTI_SHOW_CUDA")) mask |= FLAG_CUDA_ALL;
+        if (std::getenv("PTI_SHOW_UNKNOWN")) mask |= FLAG_UNKNOWN;
+        if (std::getenv("PTI_SHOW_DEBUG")) mask |= FLAG_DEBUG;
+    }
+    settings.filter_mask = mask;
 
-    cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)get_stack_callback, NULL);
+    setup_perf_events();
+
+    CUptiResult res;
+    res = cuptiSubscribe(&subscriber, (CUpti_CallbackFunc)get_stack_callback, NULL);
+    if (res != CUPTI_SUCCESS) {
+        fprintf(stderr, "Error: cuptiSubscribe failed\n");
+        return;
+    }
     
     cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API, 
                         CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000);
 
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                        CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020);
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                        CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020);
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                        CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020);
+    cuptiEnableCallback(1, subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+                        CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020);
+
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL);
+    cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
+    cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
     
     auto alloc_buf = [](uint8_t **buf, size_t *size, size_t *maxNumRecords) {
         *size = 64 * 1024; 
@@ -81,38 +169,109 @@ void CudaProfiler::init() {
     cuptiActivityRegisterCallbacks(alloc_buf, buffer_completed_callback);
 }
 
-void CudaProfiler::finalize() {
-    struct itimerval stop_timer = {};
-    setitimer(ITIMER_REAL, &stop_timer, NULL);
+void CudaProfiler::process_gpu_samples(std::unordered_map<std::string, uint64_t>& aggregated) {
+    std::unordered_map<uint32_t, uint64_t> activity_durations;
+    for (int i = 0; i < kernel_activity_count; ++i) {
+        activity_durations[kernel_activities[i].correlationId] = kernel_activities[i].duration;
+    }
     
-    cuptiActivityFlushAll(0);
-
-    uint64_t ns_per_sample = 1000000000ULL / frequency;
-
-    std::unordered_map<std::string, uint64_t> aggregated;
-
-    int gpu_total = std::min((int)gpu_sample_count, (int)kernel_activity_count);
-
+    int gpu_total = std::min((int)gpu_sample_count, MAX_SAMPLES_COUNT);
+    
     for (int i = 0; i < gpu_total; ++i) {
         std::string kName = clean_name(gpu_samples[i].kernel_name);
         std::string path = resolve_stack_to_string(gpu_samples[i].frames, gpu_samples[i].depth, kName);
+        
         if (!path.empty()) {
             if (path.back() == ';') path.pop_back();
-            aggregated[path] += kernel_activities[i].duration;
+            
+            uint64_t duration = 0;
+            auto it = activity_durations.find(gpu_samples[i].correlationId);
+            if (it != activity_durations.end()) {
+                duration = it->second;
+            }
+            
+            if (duration > 0) {
+                aggregated[path] += duration;
+            }
         }
     }
+}
 
-    int cpu_total = std::min((int)cpu_sample_count, MAX_SAMPLES_COUNT);
-    for (int i = 0; i < cpu_total; ++i) {
-        std::string path = resolve_stack_to_string(cpu_samples[i].frames, cpu_samples[i].depth);
-        if (!path.empty()) {
-            if (path.back() == ';') path.pop_back();
-            aggregated[path] += ns_per_sample;
+void CudaProfiler::process_cpu_samples(std::unordered_map<std::string, uint64_t>& aggregated) {
+    if (perf_fd == -1 || perf_page == nullptr) return;
+    
+    __sync_synchronize();
+    
+    uint64_t head = perf_page->data_head;
+    uint64_t tail = perf_page->data_tail;
+    size_t page_size = getpagesize();
+    char* base = (char*)perf_page + page_size;
+    uint64_t data_size = page_size * 8;
+    
+    uint64_t ns_per_sample = 1000000000ULL / frequency;
+    
+    while (tail < head) {
+        uint64_t offset = tail % data_size;
+        struct perf_event_header* header = (struct perf_event_header*)(base + offset);
+        
+        if (header->size == 0 || header->size > data_size) break;
+        
+        if (header->type == PERF_RECORD_SAMPLE) {
+            char* ptr = (char*)header + sizeof(struct perf_event_header);
+            
+            uint64_t ip = *(uint64_t*)ptr; ptr += sizeof(uint64_t);
+            uint32_t pid = *(uint32_t*)ptr; ptr += sizeof(uint32_t);
+            uint32_t tid = *(uint32_t*)ptr; ptr += sizeof(uint32_t);
+            uint64_t time = *(uint64_t*)ptr; ptr += sizeof(uint64_t);
+            uint64_t nr = *(uint64_t*)ptr; ptr += sizeof(uint64_t);
+            
+            void* callstack[MAX_STACK_DEPTH];
+            int depth = 0;
+            
+            if (ip && depth < MAX_STACK_DEPTH) {
+                callstack[depth++] = (void*)ip;
+            }
+            
+            for (uint64_t i = 0; i < nr && depth < MAX_STACK_DEPTH; ++i) {
+                uint64_t addr = *(uint64_t*)ptr;
+                ptr += sizeof(uint64_t);
+                if (addr) {
+                    callstack[depth++] = (void*)addr;
+                }
+            }
+
+            std::string path = resolve_stack_to_string(callstack, depth);
+            if (!path.empty()) {
+                if (path.back() == ';') path.pop_back();
+                aggregated[path] += ns_per_sample;
+            }
         }
+        
+        tail += header->size;
     }
+    
+    perf_page->data_tail = tail;
+}
+
+void CudaProfiler::finalize() {
+    if (perf_fd != -1) {
+        ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0);
+    }
+    
+    cuptiActivityFlushAll(0);
+
+    std::unordered_map<std::string, uint64_t> aggregated;
+
+    process_gpu_samples(aggregated);
+    process_cpu_samples(aggregated);
 
     for (auto const& [stack, count] : aggregated) {
         printf("%s %lu\n", stack.c_str(), count);
+    }
+    
+    if (perf_fd != -1) {
+        close(perf_fd);
+        perf_fd = -1;
     }
 }
 
@@ -133,39 +292,11 @@ std::string CudaProfiler::clean_name(const char* mangled_name) {
 FrameCategory CudaProfiler::getFrameCategory(const std::string& name) {
     if (name.empty()) return FrameCategory::APP;
 
-    if (name.find("posix_signal_handler") != std::string::npos || 
-        name.find("get_stack_callback") != std::string::npos ||
-        name.find("backtrace") != std::string::npos || 
-        name.find("resolve_stack_to_string") != std::string::npos) {
-        return FrameCategory::DEBUG;
+    for (const auto& rule : kCategoryRules) {
+        if (name.find(rule.substr) != std::string::npos) {
+            return rule.category;
+        }
     }
-
-    if (name.find("CudaProfiler::") != std::string::npos || 
-        name.find("cupti") != std::string::npos || 
-        name.find("CUpti") != std::string::npos ||
-        name.find("init_trace") != std::string::npos ||
-        name.find("finalize_trace") != std::string::npos) {
-        return FrameCategory::INTERNAL;
-    }
-
-    if (name.find("cuDriver") != std::string::npos || 
-        name.find("cuDevice") != std::string::npos ||
-        name.find("nvaci") != std::string::npos ||
-        name.find("libcuda") != std::string::npos) {
-        return FrameCategory::CUDA;
-    }
-
-    if (name.find("__libc") != std::string::npos || 
-        name.find("pthread") != std::string::npos || 
-        name.find("_dl_") != std::string::npos ||
-        name.find("_IO_") != std::string::npos ||
-        name.find("ioctl") != std::string::npos ||
-        name.find("D3DKMT") != std::string::npos ||
-        name.find("_start") != std::string::npos) {
-        return FrameCategory::SYSTEM;
-    }
-
-    if (name.find("unknown") != std::string::npos) return FrameCategory::UNKNOWN;
 
     return FrameCategory::APP;
 }
@@ -192,14 +323,14 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
                 char buffer[128];
                 snprintf(buffer, sizeof(buffer), "%s[+0x%lx]", fname.c_str(), offset);
 
-                // Автоматическое определение категории по имени файла
                 FrameCategory cat = FrameCategory::UNKNOWN;
                 std::string s_name = buffer;
                 
                 if (s_name.find("libcuda") != std::string::npos || 
-                    s_name.find("nvaci") != std::string::npos ||
-                    s_name.find("cudart") != std::string::npos) {
-                    cat = FrameCategory::CUDA;
+                    s_name.find("nvaci") != std::string::npos) {
+                    cat = FrameCategory::CUDA_DRIVER;
+                } else if (s_name.find("cudart") != std::string::npos) {
+                    cat = FrameCategory::CUDA_RUNTIME;
                 } else if (s_name.find("libc.so") != std::string::npos || 
                            s_name.find("pthread") != std::string::npos) {
                     cat = FrameCategory::SYSTEM;
@@ -214,10 +345,10 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
 
         const CachedFrame& frame = symbol_cache[addr];
 
-        if (frame.category == FrameCategory::INTERNAL && !settings.show_internal) continue;
-        if (frame.category == FrameCategory::SYSTEM && !settings.show_system) continue;
-        if (frame.category == FrameCategory::CUDA && !settings.show_cuda) continue;
-        if (frame.category == FrameCategory::UNKNOWN && !settings.show_unknown) continue;
+        if (!(settings.filter_mask & (1 << static_cast<int>(frame.category)))) {
+            continue;
+        }
+
         if (frame.category == FrameCategory::DEBUG && !show_debug) continue;
 
         if (!kernelName.empty() && kernelName == frame.name) continue;
@@ -236,25 +367,38 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
     return full_path;
 }
 
-void CudaProfiler::posix_signal_handler(int sig, siginfo_t* info, void* context) {
-    auto& self = instance();
-    int idx = self.cpu_sample_count.fetch_add(1);
-    if (idx < MAX_SAMPLES_COUNT) {
-        self.cpu_samples[idx].depth = backtrace(self.cpu_samples[idx].frames, MAX_STACK_DEPTH);
-    }
-}
-
 void CudaProfiler::get_stack_callback(void* userdata, CUpti_CallbackDomain domain, 
                                       CUpti_CallbackId cbid, const CUpti_CallbackData* cbInfo) {
-    if (cbid != CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000 || 
-        cbInfo->callbackSite != CUPTI_API_ENTER) return;
+    if (cbInfo->callbackSite != CUPTI_API_ENTER) return;
+    
+    const char* func_name = nullptr;
+    switch (cbid) {
+        case CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000:
+            func_name = cbInfo->symbolName;
+            break;
+        case CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020:
+            func_name = "cudaMemcpy";
+            break;
+        case CUPTI_RUNTIME_TRACE_CBID_cudaMemcpyAsync_v3020:
+            func_name = "cudaMemcpyAsync";
+            break;
+        case CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020:
+            func_name = "cudaMalloc";
+            break;
+        case CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020:
+            func_name = "cudaFree";
+            break;
+        default:
+            return;
+    }
 
     auto& self = instance();
     int idx = self.gpu_sample_count.fetch_add(1);
     if (idx < MAX_SAMPLES_COUNT) {
         self.gpu_samples[idx].depth = backtrace(self.gpu_samples[idx].frames, MAX_STACK_DEPTH);
-        strncpy(self.gpu_samples[idx].kernel_name, cbInfo->symbolName, 127);
+        strncpy(self.gpu_samples[idx].kernel_name, func_name, 127);
         self.gpu_samples[idx].kernel_name[127] = '\0';
+        self.gpu_samples[idx].correlationId = cbInfo->correlationId;
     }
 }
 
@@ -263,12 +407,31 @@ void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, u
     CUpti_Activity *record = NULL;
     auto& self = instance();
     while (cuptiActivityGetNextRecord(buffer, validSize, &record) == CUPTI_SUCCESS) {
-        if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL || record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
-            auto *k = (CUpti_ActivityKernel4 *)record;
-            int idx = self.kernel_activity_count.fetch_add(1);
-            if (idx < MAX_SAMPLES_COUNT) {
-                self.kernel_activities[idx] = {k->correlationId, (uint64_t)(k->end - k->start)};
+        switch (record->kind) {
+            case CUPTI_ACTIVITY_KIND_KERNEL:
+            case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL: {
+                auto *k = (CUpti_ActivityKernel4 *)record;
+                int idx = self.kernel_activity_count.fetch_add(1);
+                if (idx < MAX_SAMPLES_COUNT) {
+                    self.kernel_activities[idx].correlationId = k->correlationId;
+                    self.kernel_activities[idx].duration = (uint64_t)(k->end - k->start);
+                    strncpy(self.kernel_activities[idx].name, k->name, 127);
+                    self.kernel_activities[idx].name[127] = '\0';
+                }
+                break;
             }
+            case CUPTI_ACTIVITY_KIND_MEMCPY: {
+                auto *m = (CUpti_ActivityMemcpy *)record;
+                int idx = self.kernel_activity_count.fetch_add(1);
+                if (idx < MAX_SAMPLES_COUNT) {
+                    self.kernel_activities[idx].correlationId = m->correlationId;
+                    self.kernel_activities[idx].duration = (uint64_t)(m->end - m->start);
+                    self.kernel_activities[idx].name[0] = '\0';
+                }
+                break;
+            }
+            default:
+                break;
         }
     }
     free(buffer);

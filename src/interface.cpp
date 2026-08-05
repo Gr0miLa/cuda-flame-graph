@@ -24,18 +24,18 @@ extern "C" {
         printf("Usage: ./pti_loader [options] <application> [args]\n\n");
         printf("Options:\n");
         printf("  -f, --freq <value>        Set sampling frequency in Hz (default: 99)\n");
-        printf("  -i, --show-internal       Show profiler internal overhead\n");
-        printf("  -s, --show-system         Show system functions\n");
-        printf("  -c, --show-cuda           Show libcuda functions\n");
-        printf("  -u, --show-unknown        Show unknown functions\n");
-        printf("  -a, --show-all            Show all functions\n");
+        printf("  -p, --profile <name>      Set filtering profile (default: standard)\n");
         printf("  -h, --help                Show this help message and exit\n");
+        printf("\nProfiles:\n");
+        printf("  minimal  - App code + CUDA API functions (cudaMalloc, cudaMemcpy, etc.)\n");
+        printf("  standard - + System libraries (libc, pthread) [RECOMMENDED]\n");
+        printf("  full     - + Driver/Runtime internals + Unknown functions\n");
+        printf("  debug    - Everything including profiler overhead\n");
         printf("\nExample:\n");
-        printf("  ./pti_loader -f 999 ./my_cuda_app\n");
+        printf("  ./pti_loader -f 999 -p standard ./my_cuda_app\n");
     }
 
     int ParseArgs(int argc, char* argv[]) {
-        // setenv("PTI_DEBUG", "1", 1);
         int i = 1;
         while (i < argc) {
             const char* arg = argv[i];
@@ -57,21 +57,20 @@ extern "C" {
                     Usage();
                     exit(1);
                 }
-            } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--show-internal") == 0) {
-                setenv("PTI_SHOW_INTERNAL", "1", 1);
-                i += 1;
-            } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--show-system") == 0) {
-                setenv("PTI_SHOW_SYSTEM", "1", 1);
-                i += 1;
-            } else if (strcmp(arg, "-u") == 0 || strcmp(arg, "--show-unknown") == 0) {
-                setenv("PTI_SHOW_UNKNOWN", "1", 1);
-                i += 1;
-            } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--show-cuda") == 0) {
-                setenv("PTI_SHOW_CUDA", "1", 1);
-                i += 1;
-            } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--show-all") == 0) {
-                setenv("PTI_SHOW_ALL", "1", 1);
-                i += 1;
+            } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--profile") == 0) {
+                if (i + 1 < argc) {
+                    std::string prof = argv[i + 1];
+                    if (prof != "minimal" && prof != "standard" && prof != "full" && prof != "debug") {
+                        fprintf(stderr, "Error: Invalid profile '%s'. Choose from: minimal, standard, full, debug.\n", prof.c_str());
+                        exit(1);
+                    }
+                    setenv("PTI_PROFILE", argv[i + 1], 1);
+                    i += 2;
+                } else {
+                    fprintf(stderr, "Error: %s requires a value.\n", arg);
+                    Usage();
+                    exit(1);
+                }
             } else if (arg[0] != '-') {
                 break;
             } else {
