@@ -10,7 +10,7 @@ add_library(cuda_profiler SHARED
     src/interface.cpp
 )
 target_include_directories(cuda_profiler PRIVATE include)
-target_link_libraries(cuda_profiler PRIVATE CUDA::cudart CUDA::cupti dl)
+target_link_libraries(cuda_profiler PRIVATE CUDA::cudart CUDA::cupti CUDA::cuda_driver dl)
 
 set_target_properties(cuda_profiler PROPERTIES OUTPUT_NAME "cupti_prof")
 

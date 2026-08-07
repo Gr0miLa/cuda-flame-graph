@@ -67,6 +67,23 @@ struct KernelRecord {
     char name[128];
 };
 
+struct PCSamplingRecord {
+    uint32_t correlationId;
+    uint64_t pcOffset;
+    uint32_t functionIndex;
+    char functionName[128];
+    CUpti_ActivityPCSamplingStallReason stallReason;
+    uint32_t samples;
+    uint32_t latencySamples;
+    uint64_t cubinCrc;
+};
+
+struct PCSamplingData {
+    PCSamplingRecord records[MAX_SAMPLES_COUNT];
+    std::atomic<int> record_count{0};
+    CUpti_ActivityPCSamplingPeriod samplingPeriod;
+};
+
 struct CachedFrame {
     std::string name;
     FrameCategory category;
@@ -88,18 +105,28 @@ private:
     GpuSample gpu_samples[MAX_SAMPLES_COUNT];
     std::atomic<int> gpu_sample_count{0};
     
+    PCSamplingData pc_sampling_data;
+    bool pc_sampling_enabled = false;
+    bool stall_mode = false;
+    bool show_all_stalls = false;
+    
     std::unordered_map<void*, CachedFrame> symbol_cache;
 
     CudaProfiler() = default;
     ~CudaProfiler() = default;
 
     void setup_perf_events();
+    void setup_pc_sampling(CUpti_ActivityPCSamplingPeriod period);
 
     std::string resolve_stack_to_string(void** frames, int depth, const std::string& kernelName = "");
     std::string clean_name(const char* mangled_name);
 
     void process_gpu_samples(std::unordered_map<std::string, uint64_t>& aggregated);
     void process_cpu_samples(std::unordered_map<std::string, uint64_t>& aggregated);
+    void process_pc_sampling_records(std::unordered_map<std::string, uint64_t>& aggregated);
+    
+    std::string get_stall_reason_name(CUpti_ActivityPCSamplingStallReason reason);
+    uint64_t estimate_cycles_per_sample(CUpti_ActivityPCSamplingPeriod period);
 
     static void CUPTIAPI get_stack_callback(void* userdata, CUpti_CallbackDomain domain, 
                                             CUpti_CallbackId cbid, const CUpti_CallbackData* cbInfo);

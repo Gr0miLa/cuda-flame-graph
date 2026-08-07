@@ -74,7 +74,9 @@ void CudaProfiler::setup_perf_events() {
 
     perf_fd = perf_event_open(&pe, 0, -1, -1, 0);
     if (perf_fd == -1) {
-        fprintf(stderr, "Error opening perf event. Run with root privileges or set perf_event_paranoid to -1.\n");
+        fprintf(stderr, "Error: CPU profiling requires root privileges.\n");
+        fprintf(stderr, "Solution: Run with 'sudo' or set:\n");
+        fprintf(stderr, "  sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'\n");
         return;
     }
 
@@ -95,6 +97,54 @@ void CudaProfiler::setup_perf_events() {
 
     ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0);
+}
+
+void CudaProfiler::setup_pc_sampling(CUpti_ActivityPCSamplingPeriod period) {
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    
+    if (!ctx) {
+        fprintf(stderr, "Warning: No CUDA context for PC Sampling\n");
+        return;
+    }
+    
+    CUdevice device;
+    CUresult res_cu = cuCtxGetDevice(&device);
+    if (res_cu != CUDA_SUCCESS) {
+        fprintf(stderr, "Warning: Failed to get CUDA device\n");
+        return;
+    }
+    
+    int major = 0, minor = 0;
+    cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+    cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+    
+    if (major < 5 || (major == 5 && minor < 2)) {
+        fprintf(stderr, "Warning: PC Sampling requires CC 5.2+ (current: %d.%d)\n", major, minor);
+        return;
+    }
+    
+    CUpti_ActivityPCSamplingConfig config = {};
+    config.size = sizeof(CUpti_ActivityPCSamplingConfig);
+    config.samplingPeriod = period;
+    config.samplingPeriod2 = 0;
+    
+    CUptiResult res = cuptiActivityConfigurePCSampling(ctx, &config);
+    if (res != CUPTI_SUCCESS) {
+        fprintf(stderr, "Warning: cuptiActivityConfigurePCSampling failed (error %d)\n", res);
+        return;
+    }
+    
+    pc_sampling_data.samplingPeriod = config.samplingPeriod;
+    
+    res = cuptiActivityEnable(CUPTI_ACTIVITY_KIND_PC_SAMPLING);
+    if (res != CUPTI_SUCCESS) {
+        fprintf(stderr, "Warning: cuptiActivityEnable(PC_SAMPLING) failed (error %d)\n", res);
+        return;
+    }
+    
+    pc_sampling_enabled = true;
+    fprintf(stderr, "PC Sampling enabled (period: %d, CC %d.%d)\n", (int)period, major, minor);
 }
 
 void CudaProfiler::init() {
@@ -125,15 +175,32 @@ void CudaProfiler::init() {
         } else if (prof == "debug") {
             mask = 0xFFFFFFFF;
         }
-    } else {
-        if (std::getenv("PTI_SHOW_ALL")) mask = 0xFFFFFFFF;
-        if (std::getenv("PTI_SHOW_SYSTEM")) mask |= FLAG_SYSTEM;
-        if (std::getenv("PTI_SHOW_INTERNAL")) mask |= FLAG_INTERNAL;
-        if (std::getenv("PTI_SHOW_CUDA")) mask |= FLAG_CUDA_ALL;
-        if (std::getenv("PTI_SHOW_UNKNOWN")) mask |= FLAG_UNKNOWN;
-        if (std::getenv("PTI_SHOW_DEBUG")) mask |= FLAG_DEBUG;
     }
     settings.filter_mask = mask;
+
+    if (const char* stall_mode_env = std::getenv("PTI_STALL_MODE")) {
+        stall_mode = (std::string(stall_mode_env) == "1");
+    }
+    
+    if (const char* show_all_env = std::getenv("PTI_SHOW_ALL_STALLS")) {
+        show_all_stalls = (std::string(show_all_env) == "1");
+    }
+    
+    CUpti_ActivityPCSamplingPeriod sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW;
+    if (const char* period_env = std::getenv("PTI_SAMPLING_PERIOD")) {
+        std::string period(period_env);
+        if (period == "min") {
+            sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MIN;
+        } else if (period == "low") {
+            sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW;
+        } else if (period == "mid") {
+            sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MID;
+        } else if (period == "high") {
+            sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_HIGH;
+        } else if (period == "max") {
+            sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MAX;
+        }
+    }
 
     setup_perf_events();
 
@@ -159,6 +226,10 @@ void CudaProfiler::init() {
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL);
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
+    
+    if (stall_mode) {
+        setup_pc_sampling(sampling_period);
+    }
     
     auto alloc_buf = [](uint8_t **buf, size_t *size, size_t *maxNumRecords) {
         *size = 64 * 1024; 
@@ -191,6 +262,10 @@ void CudaProfiler::process_gpu_samples(std::unordered_map<std::string, uint64_t>
             }
             
             if (duration > 0) {
+                if (std::getenv("PTI_DEBUG")) {
+                    fprintf(stderr, "  [DEBUG] path='%s' corrId=%u duration=%lu\n", 
+                            path.c_str(), gpu_samples[i].correlationId, duration);
+                }
                 aggregated[path] += duration;
             }
         }
@@ -265,6 +340,26 @@ void CudaProfiler::finalize() {
     process_gpu_samples(aggregated);
     process_cpu_samples(aggregated);
 
+    // Отладочный вывод
+    fprintf(stderr, "\n=== Profiler Statistics ===\n");
+    fprintf(stderr, "GPU samples captured: %d\n", (int)gpu_sample_count);
+    fprintf(stderr, "GPU activities recorded: %d\n", (int)kernel_activity_count);
+    fprintf(stderr, "Unique stacks aggregated: %zu\n", aggregated.size());
+    
+    if (perf_fd != -1) {
+        fprintf(stderr, "CPU profiling: ENABLED\n");
+    } else {
+        fprintf(stderr, "CPU profiling: DISABLED (run with sudo)\n");
+    }
+    
+    if (pc_sampling_enabled) {
+        fprintf(stderr, "PC Sampling records: %d\n", (int)pc_sampling_data.record_count);
+        fprintf(stderr, "PC Sampling period: %d\n", (int)pc_sampling_data.samplingPeriod);
+    }
+    
+    fprintf(stderr, "Filter profile: standard (APP + CUDA_API + SYSTEM)\n");
+    fprintf(stderr, "===========================\n\n");
+    
     for (auto const& [stack, count] : aggregated) {
         printf("%s %lu\n", stack.c_str(), count);
     }
@@ -359,7 +454,7 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
     }
 
     if (!kernelName.empty()) {
-        full_path += "[compute] " + kernelName;
+        full_path += kernelName;
     } else if (!full_path.empty() && full_path.back() == ';') {
         full_path.pop_back();
     }
