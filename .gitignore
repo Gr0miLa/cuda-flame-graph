@@ -1,5 +1,6 @@
 backup/
 build/
+results/
 
 *.so
 *.folded

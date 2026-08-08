@@ -21,7 +21,7 @@ extern "C" {
 
     void Usage() {
         printf("CUDA C++ Profiler Loader\n");
-        printf("Usage: ./pti_loader [options] <application> [args]\n\n");
+        printf("Usage: ./cuprof [options] <application> [args]\n\n");
         printf("Options:\n");
         printf("  -f, --freq <value>        Set sampling frequency in Hz (default: 99)\n");
         printf("  -p, --profile <name>      Set filtering profile (default: standard)\n");
@@ -36,8 +36,8 @@ extern "C" {
         printf("  full     - + Driver/Runtime internals + Unknown functions\n");
         printf("  debug    - Everything including profiler overhead\n");
         printf("\nExamples:\n");
-        printf("  ./pti_loader -f 999 -p standard ./my_cuda_app\n");
-        printf("  ./pti_loader --stall-mode --sampling-period low ./my_cuda_app\n");
+        printf("  ./cuprof -f 999 -p standard ./my_cuda_app\n");
+        printf("  ./cuprof --stall-mode --sampling-period low ./my_cuda_app\n");
     }
 
     int ParseArgs(int argc, char* argv[]) {

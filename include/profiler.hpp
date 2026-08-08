@@ -75,7 +75,6 @@ struct PCSamplingRecord {
     CUpti_ActivityPCSamplingStallReason stallReason;
     uint32_t samples;
     uint32_t latencySamples;
-    uint64_t cubinCrc;
 };
 
 struct PCSamplingData {
