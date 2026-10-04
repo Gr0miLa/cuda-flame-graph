@@ -22,7 +22,6 @@
 #include <unistd.h>
 
 const int MAX_STACK_DEPTH = 64;
-const int MAX_SAMPLES_COUNT = 50000;
 
 enum class FrameCategory {
     APP,
@@ -78,9 +77,13 @@ struct PCSamplingRecord {
 };
 
 struct PCSamplingData {
-    PCSamplingRecord records[MAX_SAMPLES_COUNT];
-    std::atomic<int> record_count{0};
+    std::vector<PCSamplingRecord> records;
+    std::mutex records_mutex;
     CUpti_ActivityPCSamplingPeriod samplingPeriod;
+    
+    PCSamplingData() {
+        records.reserve(10000);
+    }
 };
 
 struct CachedFrame {
@@ -98,11 +101,11 @@ private:
 
     CUpti_SubscriberHandle subscriber;
 
-    KernelRecord kernel_activities[MAX_SAMPLES_COUNT];
-    std::atomic<int> kernel_activity_count{0};
+    std::vector<KernelRecord> kernel_activities;
+    std::mutex kernel_activities_mutex;
 
-    GpuSample gpu_samples[MAX_SAMPLES_COUNT];
-    std::atomic<int> gpu_sample_count{0};
+    std::vector<GpuSample> gpu_samples;
+    std::mutex gpu_samples_mutex;
     
     PCSamplingData pc_sampling_data;
     bool pc_sampling_enabled = false;
@@ -117,7 +120,7 @@ private:
     void setup_perf_events();
     void setup_pc_sampling(CUpti_ActivityPCSamplingPeriod period);
 
-    std::string resolve_stack_to_string(void** frames, int depth, const std::string& kernelName = "");
+    std::string resolve_stack_to_string(void* const* frames, int depth, const std::string& kernelName = "", bool is_gpu = false);
     std::string clean_name(const char* mangled_name);
 
     void process_gpu_samples(std::unordered_map<std::string, uint64_t>& aggregated);
@@ -125,7 +128,6 @@ private:
     void process_pc_sampling_records(std::unordered_map<std::string, uint64_t>& aggregated);
     
     std::string get_stall_reason_name(CUpti_ActivityPCSamplingStallReason reason);
-    uint64_t estimate_cycles_per_sample(CUpti_ActivityPCSamplingPeriod period);
 
     static void CUPTIAPI get_stack_callback(void* userdata, CUpti_CallbackDomain domain, 
                                             CUpti_CallbackId cbid, const CUpti_CallbackData* cbInfo);

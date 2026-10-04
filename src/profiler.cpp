@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <map>
 
 struct CategoryRule {
     const char* substr;
@@ -178,23 +179,6 @@ std::string CudaProfiler::get_stall_reason_name(CUpti_ActivityPCSamplingStallRea
     }
 }
 
-uint64_t CudaProfiler::estimate_cycles_per_sample(CUpti_ActivityPCSamplingPeriod period) {
-    switch (period) {
-        case CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MIN:
-            return 1;
-        case CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW:
-            return 10;
-        case CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MID:
-            return 50;
-        case CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_HIGH:
-            return 100;
-        case CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_MAX:
-            return 500;
-        default:
-            return 10;
-    }
-}
-
 void CudaProfiler::init() {
     const char* pti_env = std::getenv("PTI_ENABLE");
     if (pti_env == nullptr || std::string(pti_env) != "1") {
@@ -250,6 +234,9 @@ void CudaProfiler::init() {
         }
     }
 
+    gpu_samples.reserve(50000);
+    kernel_activities.reserve(50000);
+    
     setup_perf_events();
 
     CUptiResult res;
@@ -286,31 +273,41 @@ void CudaProfiler::init() {
 
 void CudaProfiler::process_gpu_samples(std::unordered_map<std::string, uint64_t>& aggregated) {
     std::unordered_map<uint32_t, uint64_t> activity_durations;
-    for (int i = 0; i < kernel_activity_count; ++i) {
-        activity_durations[kernel_activities[i].correlationId] = kernel_activities[i].duration;
+    
+    {
+        std::lock_guard<std::mutex> lock(kernel_activities_mutex);
+        for (const auto& activity : kernel_activities) {
+            activity_durations[activity.correlationId] = activity.duration;
+        }
     }
     
-    int gpu_total = std::min((int)gpu_sample_count, MAX_SAMPLES_COUNT);
+    uint64_t ns_per_sample = 1000000000ULL / frequency;
     
-    for (int i = 0; i < gpu_total; ++i) {
-        std::string kName = clean_name(gpu_samples[i].kernel_name);
-        std::string path = resolve_stack_to_string(gpu_samples[i].frames, gpu_samples[i].depth, kName);
-        
-        if (!path.empty()) {
-            if (path.back() == ';') path.pop_back();
+    {
+        std::lock_guard<std::mutex> lock(gpu_samples_mutex);
+        for (const auto& sample : gpu_samples) {
+            std::string kName = clean_name(sample.kernel_name);
+            std::string path = resolve_stack_to_string(sample.frames, sample.depth, kName, true);
             
-            uint64_t duration = 0;
-            auto it = activity_durations.find(gpu_samples[i].correlationId);
-            if (it != activity_durations.end()) {
-                duration = it->second;
-            }
-            
-            if (duration > 0) {
-                if (std::getenv("PTI_DEBUG")) {
-                    fprintf(stderr, "  [DEBUG] path='%s' corrId=%u duration=%lu\n", 
-                            path.c_str(), gpu_samples[i].correlationId, duration);
+            if (!path.empty()) {
+                if (path.back() == ';') path.pop_back();
+                
+                uint64_t duration = 0;
+                auto it = activity_durations.find(sample.correlationId);
+                if (it != activity_durations.end()) {
+                    duration = it->second;
                 }
-                aggregated[path] += duration;
+                
+                if (duration > 0) {
+                    uint64_t equivalent_samples = duration / ns_per_sample;
+                    if (equivalent_samples == 0) equivalent_samples = 1;
+                    
+                    if (std::getenv("PTI_DEBUG")) {
+                        fprintf(stderr, "  [DEBUG] path='%s' corrId=%u duration=%lu samples=%lu\n", 
+                                path.c_str(), sample.correlationId, duration, equivalent_samples);
+                    }
+                    aggregated[path] += equivalent_samples;
+                }
             }
         }
     }
@@ -326,8 +323,6 @@ void CudaProfiler::process_cpu_samples(std::unordered_map<std::string, uint64_t>
     size_t page_size = getpagesize();
     char* base = (char*)perf_page + page_size;
     uint64_t data_size = page_size * 8;
-    
-    uint64_t ns_per_sample = 1000000000ULL / frequency;
     
     while (tail < head) {
         uint64_t offset = tail % data_size;
@@ -361,7 +356,6 @@ void CudaProfiler::process_cpu_samples(std::unordered_map<std::string, uint64_t>
 
             std::string path = resolve_stack_to_string(callstack, depth);
             
-            // Filter out GPU-related stacks (captured during kernel launch)
             if (path.find("__device_stub__") != std::string::npos) {
                 tail += header->size;
                 continue;
@@ -369,7 +363,7 @@ void CudaProfiler::process_cpu_samples(std::unordered_map<std::string, uint64_t>
             
             if (!path.empty()) {
                 if (path.back() == ';') path.pop_back();
-                aggregated[path] += ns_per_sample;
+                aggregated[path] += 1;
             }
         }
         
@@ -382,51 +376,53 @@ void CudaProfiler::process_cpu_samples(std::unordered_map<std::string, uint64_t>
 void CudaProfiler::process_pc_sampling_records(std::unordered_map<std::string, uint64_t>& aggregated) {
     if (!pc_sampling_enabled) return;
     
-    uint64_t cycles_per_sample = estimate_cycles_per_sample(pc_sampling_data.samplingPeriod);
-    
-    // Create map: correlationId → kernel name
     std::unordered_map<uint32_t, std::string> kernel_names;
-    for (int i = 0; i < kernel_activity_count; ++i) {
-        kernel_names[kernel_activities[i].correlationId] = clean_name(kernel_activities[i].name);
+    {
+        std::lock_guard<std::mutex> lock(kernel_activities_mutex);
+        for (const auto& activity : kernel_activities) {
+            kernel_names[activity.correlationId] = clean_name(activity.name);
+        }
     }
     
-    // Create map: correlationId → CPU stack (frames, depth)
-    std::unordered_map<uint32_t, std::pair<void**, int>> gpu_stacks;
-    int gpu_total = std::min((int)gpu_sample_count, MAX_SAMPLES_COUNT);
-    for (int i = 0; i < gpu_total; ++i) {
-        gpu_stacks[gpu_samples[i].correlationId] = {
-            gpu_samples[i].frames, 
-            gpu_samples[i].depth
-        };
+    std::multimap<uint32_t, std::string> gpu_stacks;
+    {
+        std::lock_guard<std::mutex> lock(gpu_samples_mutex);
+        for (const auto& sample : gpu_samples) {
+            std::string kernel_name = "unknown_kernel";
+            auto it_kn = kernel_names.find(sample.correlationId);
+            if (it_kn != kernel_names.end()) {
+                kernel_name = it_kn->second;
+            }
+            std::string stack_str = resolve_stack_to_string(sample.frames, sample.depth, kernel_name, true);
+            if (!stack_str.empty() && stack_str.back() == ';') {
+                stack_str.pop_back();
+            }
+            gpu_stacks.insert({sample.correlationId, stack_str});
+        }
     }
     
-    for (int i = 0; i < pc_sampling_data.record_count; ++i) {
-        const auto& rec = pc_sampling_data.records[i];
+    uint32_t unmatched_count = 0;
+    
+    std::lock_guard<std::mutex> lock(pc_sampling_data.records_mutex);
+    for (const auto& rec : pc_sampling_data.records) {
+        if (rec.latencySamples == 0) continue;
         
-        uint64_t stall_cycles = rec.latencySamples * cycles_per_sample;
-        
-        if (stall_cycles == 0) continue;
-        
-        // Get kernel name
         std::string kernel_name = "unknown_kernel";
         auto it_kernel = kernel_names.find(rec.correlationId);
         if (it_kernel != kernel_names.end()) {
             kernel_name = it_kernel->second;
         }
         
-        // Get CPU stack from gpu_samples
         std::string cpu_stack = "";
-        auto it_stack = gpu_stacks.find(rec.correlationId);
-        if (it_stack != gpu_stacks.end()) {
-            cpu_stack = resolve_stack_to_string(it_stack->second.first, it_stack->second.second, kernel_name);
-            if (!cpu_stack.empty() && cpu_stack.back() == ';') {
-                cpu_stack.pop_back();
-            }
+        auto it_stack_range = gpu_stacks.equal_range(rec.correlationId);
+        if (it_stack_range.first != it_stack_range.second) {
+            cpu_stack = it_stack_range.first->second;
+        } else {
+            unmatched_count++;
         }
         
         std::string stall_name = get_stall_reason_name(rec.stallReason);
         
-        // Format: cpu_stack;[stall=reason];[pc=offset]
         std::string path;
         if (!cpu_stack.empty()) {
             path = cpu_stack + ";[stall=" + stall_name + "];[pc=0x" + 
@@ -436,7 +432,12 @@ void CudaProfiler::process_pc_sampling_records(std::unordered_map<std::string, u
                    std::to_string(rec.pcOffset) + "]";
         }
         
-        aggregated[path] += stall_cycles;
+        aggregated[path] += rec.latencySamples;
+    }
+    
+    if (unmatched_count > 0) {
+        fprintf(stderr, "Warning: %u PC sampling records had no matching CPU stack (correlationId mismatch)\n", 
+                unmatched_count);
     }
 }
 
@@ -449,23 +450,24 @@ void CudaProfiler::finalize() {
 
     std::unordered_map<std::string, uint64_t> aggregated;
 
-    process_cpu_samples(aggregated);
-    
-    // Follow Brendan Gregg's approach: mutually exclusive modes
     if (stall_mode) {
-        // Stall profiling mode - show where time is lost (stall cycles)
         if (pc_sampling_enabled) {
             process_pc_sampling_records(aggregated);
         }
     } else {
-        // Execution time mode - show overall execution duration
+        process_cpu_samples(aggregated);
         process_gpu_samples(aggregated);
     }
 
-    // Отладочный вывод
     fprintf(stderr, "\n=== Profiler Statistics ===\n");
-    fprintf(stderr, "GPU samples captured: %d\n", (int)gpu_sample_count);
-    fprintf(stderr, "GPU activities recorded: %d\n", (int)kernel_activity_count);
+    {
+        std::lock_guard<std::mutex> lock(gpu_samples_mutex);
+        fprintf(stderr, "GPU samples captured: %zu\n", gpu_samples.size());
+    }
+    {
+        std::lock_guard<std::mutex> lock(kernel_activities_mutex);
+        fprintf(stderr, "GPU activities recorded: %zu\n", kernel_activities.size());
+    }
     fprintf(stderr, "Unique stacks aggregated: %zu\n", aggregated.size());
     
     if (perf_fd != -1) {
@@ -475,7 +477,8 @@ void CudaProfiler::finalize() {
     }
     
     if (pc_sampling_enabled) {
-        fprintf(stderr, "PC Sampling records: %d\n", (int)pc_sampling_data.record_count);
+        std::lock_guard<std::mutex> lock(pc_sampling_data.records_mutex);
+        fprintf(stderr, "PC Sampling records: %zu\n", pc_sampling_data.records.size());
         fprintf(stderr, "PC Sampling period: %d\n", (int)pc_sampling_data.samplingPeriod);
     }
     
@@ -518,7 +521,7 @@ FrameCategory CudaProfiler::getFrameCategory(const std::string& name) {
     return FrameCategory::APP;
 }
 
-std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, const std::string& kernelName) {
+std::string CudaProfiler::resolve_stack_to_string(void* const* callstack, int frames, const std::string& kernelName, bool is_gpu) {
     std::string full_path = "";
     bool show_debug = (std::getenv("PTI_DEBUG") != nullptr);
 
@@ -577,7 +580,6 @@ std::string CudaProfiler::resolve_stack_to_string(void** callstack, int frames, 
 
     if (!kernelName.empty()) {
         full_path += kernelName;
-        fprintf(stderr, "%s - kernelName\n", kernelName.c_str());
     } else if (!full_path.empty() && full_path.back() == ';') {
         full_path.pop_back();
     }
@@ -591,7 +593,6 @@ void CudaProfiler::get_stack_callback(void* userdata, CUpti_CallbackDomain domai
     
     auto& self = instance();
     
-    // Setup PC Sampling on first CUDA call if enabled but not yet configured
     if (self.stall_mode && !self.pc_sampling_enabled) {
         CUpti_ActivityPCSamplingPeriod period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW;
         if (const char* period_env = std::getenv("PTI_SAMPLING_PERIOD")) {
@@ -626,13 +627,14 @@ void CudaProfiler::get_stack_callback(void* userdata, CUpti_CallbackDomain domai
             return;
     }
 
-    int idx = self.gpu_sample_count.fetch_add(1);
-    if (idx < MAX_SAMPLES_COUNT) {
-        self.gpu_samples[idx].depth = backtrace(self.gpu_samples[idx].frames, MAX_STACK_DEPTH);
-        strncpy(self.gpu_samples[idx].kernel_name, func_name, 127);
-        self.gpu_samples[idx].kernel_name[127] = '\0';
-        self.gpu_samples[idx].correlationId = cbInfo->correlationId;
-    }
+    GpuSample sample;
+    sample.depth = backtrace(sample.frames, MAX_STACK_DEPTH);
+    strncpy(sample.kernel_name, func_name, 127);
+    sample.kernel_name[127] = '\0';
+    sample.correlationId = cbInfo->correlationId;
+    
+    std::lock_guard<std::mutex> lock(self.gpu_samples_mutex);
+    self.gpu_samples.push_back(sample);
 }
 
 void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, uint8_t* buffer, 
@@ -644,23 +646,25 @@ void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, u
             case CUPTI_ACTIVITY_KIND_KERNEL:
             case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL: {
                 auto *k = (CUpti_ActivityKernel4 *)record;
-                int idx = self.kernel_activity_count.fetch_add(1);
-                if (idx < MAX_SAMPLES_COUNT) {
-                    self.kernel_activities[idx].correlationId = k->correlationId;
-                    self.kernel_activities[idx].duration = (uint64_t)(k->end - k->start);
-                    strncpy(self.kernel_activities[idx].name, k->name, 127);
-                    self.kernel_activities[idx].name[127] = '\0';
-                }
+                KernelRecord kr;
+                kr.correlationId = k->correlationId;
+                kr.duration = (uint64_t)(k->end - k->start);
+                strncpy(kr.name, k->name, 127);
+                kr.name[127] = '\0';
+                
+                std::lock_guard<std::mutex> lock(self.kernel_activities_mutex);
+                self.kernel_activities.push_back(kr);
                 break;
             }
             case CUPTI_ACTIVITY_KIND_MEMCPY: {
                 auto *m = (CUpti_ActivityMemcpy *)record;
-                int idx = self.kernel_activity_count.fetch_add(1);
-                if (idx < MAX_SAMPLES_COUNT) {
-                    self.kernel_activities[idx].correlationId = m->correlationId;
-                    self.kernel_activities[idx].duration = (uint64_t)(m->end - m->start);
-                    self.kernel_activities[idx].name[0] = '\0';
-                }
+                KernelRecord kr;
+                kr.correlationId = m->correlationId;
+                kr.duration = (uint64_t)(m->end - m->start);
+                kr.name[0] = '\0';
+                
+                std::lock_guard<std::mutex> lock(self.kernel_activities_mutex);
+                self.kernel_activities.push_back(kr);
                 break;
             }
             case CUPTI_ACTIVITY_KIND_PC_SAMPLING: {
@@ -673,16 +677,17 @@ void CudaProfiler::buffer_completed_callback(CUcontext ctx, uint32_t streamId, u
                     }
                 }
                 
-                int idx = self.pc_sampling_data.record_count.fetch_add(1);
-                if (idx < MAX_SAMPLES_COUNT) {
-                    self.pc_sampling_data.records[idx].correlationId = pc->correlationId;
-                    self.pc_sampling_data.records[idx].pcOffset = pc->pcOffset;
-                    self.pc_sampling_data.records[idx].functionIndex = pc->functionId;
-                    self.pc_sampling_data.records[idx].stallReason = pc->stallReason;
-                    self.pc_sampling_data.records[idx].samples = pc->samples;
-                    self.pc_sampling_data.records[idx].latencySamples = pc->latencySamples;
-                    self.pc_sampling_data.records[idx].functionName[0] = '\0';
-                }
+                PCSamplingRecord rec;
+                rec.correlationId = pc->correlationId;
+                rec.pcOffset = pc->pcOffset;
+                rec.functionIndex = pc->functionId;
+                rec.stallReason = pc->stallReason;
+                rec.samples = pc->samples;
+                rec.latencySamples = pc->latencySamples;
+                rec.functionName[0] = '\0';
+                
+                std::lock_guard<std::mutex> lock(self.pc_sampling_data.records_mutex);
+                self.pc_sampling_data.records.push_back(rec);
                 break;
             }
             default:
