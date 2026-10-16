@@ -3,6 +3,8 @@ add_executable(
     src/main.cpp
     src/cuda/vectorAdd.cu
 )
+set_property(TARGET vectorAdd PROPERTY CUDA_ARCHITECTURES
+    "${PROFILER_SAMPLE_CUDA_ARCHITECTURES}")
 
 target_include_directories(vectorAdd PRIVATE 
     ${CUDAToolkit_INCLUDE_DIRS}

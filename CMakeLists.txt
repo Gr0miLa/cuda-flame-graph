@@ -1,7 +1,9 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.24)
 project(CUPTI_Stages LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
+set(PROFILER_SAMPLE_CUDA_ARCHITECTURES "native" CACHE STRING
+    "CUDA architectures used to build profiler sample applications")
 
 find_package(CUDAToolkit REQUIRED)
 

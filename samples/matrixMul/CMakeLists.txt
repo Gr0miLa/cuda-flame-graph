@@ -3,6 +3,8 @@ add_executable(
     src/main.cpp
     src/cuda/matrixMul.cu
 )
+set_property(TARGET matrixMul PROPERTY CUDA_ARCHITECTURES
+    "${PROFILER_SAMPLE_CUDA_ARCHITECTURES}")
 
 target_include_directories(matrixMul PRIVATE 
     ${CUDAToolkit_INCLUDE_DIRS}
