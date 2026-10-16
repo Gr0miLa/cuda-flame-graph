@@ -1,9 +1,23 @@
 #include "profiler.hpp"
 #include "gpu_profiler.hpp"
-#include <iostream>
 #include <algorithm>
+#include <charconv>
 #include <cstring>
+#include <iostream>
 #include <map>
+
+namespace {
+
+std::string format_pc_offset(uint64_t pc_offset) {
+    char buffer[2 + 16];
+    buffer[0] = '0';
+    buffer[1] = 'x';
+    const auto result = std::to_chars(
+        buffer + 2, buffer + sizeof(buffer), pc_offset, 16);
+    return std::string(buffer, result.ptr);
+}
+
+}  // namespace
 
 CudaProfiler::CudaProfiler() : gpu_profiler(std::make_unique<GpuProfiler>()) {}
 
@@ -202,12 +216,11 @@ uint64_t CudaProfiler::process_pc_sampling_records(
         std::string stall_name = get_stall_reason_name(rec.stallReason);
         
         std::string path;
+        const std::string pc_frame = format_pc_offset(rec.pcOffset);
         if (!cpu_stack.empty()) {
-            path = cpu_stack + ";[stall=" + stall_name + "];[pc=0x" + 
-                   std::to_string(rec.pcOffset) + "]";
+            path = cpu_stack + ";" + stall_name + ";" + pc_frame;
         } else {
-            path = kernel_name + ";[stall=" + stall_name + "];[pc=0x" + 
-                   std::to_string(rec.pcOffset) + "]";
+            path = kernel_name + ";" + stall_name + ";" + pc_frame;
         }
         
         aggregated[path] += rec.latencySamples;
