@@ -1,10 +1,14 @@
 backup/
 build/
 results/
+cuobjdump/
+tests/
 
 *.so
 *.folded
 *.svg
+__pycache__/
+*.pyc
 
 temp.cpp
 
