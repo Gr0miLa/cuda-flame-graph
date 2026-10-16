@@ -1,6 +1,9 @@
 #ifndef CUDA_PROFILER_HPP
 #define CUDA_PROFILER_HPP
 
+#include "cpu_profiler.hpp"
+#include "stack_resolver.hpp"
+
 #include <atomic>
 #include <cstring>
 #include <cupti.h>
@@ -8,6 +11,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <signal.h>
 #include <string>
@@ -15,42 +19,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include <linux/perf_event.h>
-#include <sys/syscall.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-
 const int MAX_STACK_DEPTH = 64;
 
-enum class FrameCategory {
-    APP,
-    CUDA_API,
-    CUDA_DRIVER,
-    CUDA_RUNTIME,
-    SYSTEM,
-    INTERNAL,
-    UNKNOWN,
-    DEBUG
-};
-
-enum FrameFlags : uint32_t {
-    FLAG_APP          = 1 << 0,
-    FLAG_CUDA_API     = 1 << 1,
-    FLAG_CUDA_DRIVER  = 1 << 2,
-    FLAG_CUDA_RUNTIME = 1 << 3,
-    FLAG_SYSTEM       = 1 << 4,
-    FLAG_INTERNAL     = 1 << 5,
-    FLAG_UNKNOWN      = 1 << 6,
-    FLAG_DEBUG        = 1 << 7,
-    
-    FLAG_CUDA         = FLAG_CUDA_API,
-    FLAG_CUDA_ALL     = FLAG_CUDA_API | FLAG_CUDA_DRIVER | FLAG_CUDA_RUNTIME,
-    FLAG_DEFAULT      = FLAG_APP | FLAG_CUDA_API
-};
-
-struct ProfilerSettings {
+struct ProfilerConfig {
+    uint32_t frequency = 99;
     uint32_t filter_mask = FLAG_DEFAULT;
+    bool stall_mode = false;
+    bool show_all_stalls = false;
+    bool debug = false;
+    CUpti_ActivityPCSamplingPeriod sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW;
 };
 
 struct GpuSample {
@@ -80,61 +57,36 @@ struct PCSamplingData {
     std::vector<PCSamplingRecord> records;
     std::mutex records_mutex;
     CUpti_ActivityPCSamplingPeriod samplingPeriod;
+    uint64_t total_samples = 0;
+    uint64_t dropped_samples = 0;
+    uint64_t sampling_period_cycles = 0;
+    uint64_t record_info_count = 0;
     
     PCSamplingData() {
         records.reserve(10000);
     }
 };
 
-struct CachedFrame {
-    std::string name;
-    FrameCategory category;
-};
+class GpuProfiler;
 
 class CudaProfiler {
 private:
-    uint32_t frequency = 99;
-    ProfilerSettings settings;
-    bool is_running = false;
-    int perf_fd = -1;
-    struct perf_event_mmap_page *perf_page = nullptr;
-
-    CUpti_SubscriberHandle subscriber;
-
-    std::vector<KernelRecord> kernel_activities;
-    std::mutex kernel_activities_mutex;
-
-    std::vector<GpuSample> gpu_samples;
-    std::mutex gpu_samples_mutex;
+    ProfilerConfig config;
+    bool initialized_ = false;
+    bool finalized_ = false;
+    CpuProfiler cpu_profiler;
+    std::unique_ptr<GpuProfiler> gpu_profiler;
     
-    PCSamplingData pc_sampling_data;
-    bool pc_sampling_enabled = false;
-    bool stall_mode = false;
-    bool show_all_stalls = false;
-    
-    std::unordered_map<void*, CachedFrame> symbol_cache;
+    StackResolver stack_resolver;
 
-    CudaProfiler() = default;
-    ~CudaProfiler() = default;
-
-    void setup_perf_events();
-    void setup_pc_sampling(CUpti_ActivityPCSamplingPeriod period);
-
-    std::string resolve_stack_to_string(void* const* frames, int depth, const std::string& kernelName = "", bool is_gpu = false);
-    std::string clean_name(const char* mangled_name);
+    CudaProfiler();
+    ~CudaProfiler();
 
     void process_gpu_samples(std::unordered_map<std::string, uint64_t>& aggregated);
-    void process_cpu_samples(std::unordered_map<std::string, uint64_t>& aggregated);
-    void process_pc_sampling_records(std::unordered_map<std::string, uint64_t>& aggregated);
+    uint64_t process_pc_sampling_records(
+        std::unordered_map<std::string, uint64_t>& aggregated);
     
     std::string get_stall_reason_name(CUpti_ActivityPCSamplingStallReason reason);
-
-    static void CUPTIAPI get_stack_callback(void* userdata, CUpti_CallbackDomain domain, 
-                                            CUpti_CallbackId cbid, const CUpti_CallbackData* cbInfo);
-    static void CUPTIAPI buffer_completed_callback(CUcontext ctx, uint32_t streamId, uint8_t* buffer, 
-                                                   size_t size, size_t validSize);
-
-    FrameCategory getFrameCategory(const std::string& name);
 
 public:
     static CudaProfiler& instance();

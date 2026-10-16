@@ -7,6 +7,9 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(cuda_profiler SHARED 
     src/profiler.cpp 
+    src/cpu_profiler.cpp
+    src/gpu_profiler.cpp
+    src/stack_resolver.cpp
     src/interface.cpp
 )
 target_include_directories(cuda_profiler PRIVATE include)
