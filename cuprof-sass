@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+output_prefix=""
+sampling_period="low"
+architecture=""
+cuprof_path="${project_dir}/build/cuprof"
+flamegraph_path=""
+python_path="${PYTHON_BIN:-python3}"
+
+usage() {
+    printf '%s\n' \
+        "Запуск:" \
+        "  ./cuprof-sass --output ПУТЬ --arch АРХИТЕКТУРА [опции] -- ПРОГРАММА [АРГУМЕНТЫ...]" \
+        "" \
+        "Опции:" \
+        "  --output ПУТЬ            Имя и путь для результатов" \
+        "  --arch АРХИТЕКТУРА       Например sm_75" \
+        "  --sampling-period ПЕРИОД low, mid или high (по умолчанию low)" \
+        "  --cuprof ПУТЬ            Путь к cuprof (по умолчанию build/cuprof)" \
+        "  --flamegraph ПУТЬ        Путь к flamegraph.pl, если нужен SVG" \
+        "  -h, --help               Показать эту справку" \
+        "" \
+        "Пример:" \
+        "  ./cuprof-sass --output results/manual/run1 --arch sm_75 \\" \
+        "    --flamegraph ../FlameGraph/flamegraph.pl -- \\" \
+        "    build/samples/matrixMul/matrixMul"
+}
+
+fail() {
+    printf 'Ошибка: %s\n' "$1" >&2
+    exit 1
+}
+
+require_value() {
+    [[ $# -ge 2 ]] || fail "после $1 нужно указать значение"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output)
+            require_value "$@"
+            output_prefix="$2"
+            shift 2
+            ;;
+        --arch)
+            require_value "$@"
+            architecture="$2"
+            shift 2
+            ;;
+        --sampling-period)
+            require_value "$@"
+            sampling_period="$2"
+            shift 2
+            ;;
+        --cuprof)
+            require_value "$@"
+            cuprof_path="$2"
+            shift 2
+            ;;
+        --flamegraph)
+            require_value "$@"
+            flamegraph_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            fail "неизвестная опция $1. Программу укажите после --"
+            ;;
+    esac
+done
+
+[[ -n "$output_prefix" ]] || fail "не указан --output"
+[[ -n "$architecture" ]] || fail "не указан --arch"
+[[ $# -gt 0 ]] || fail "после -- нужно указать CUDA-программу"
+
+case "$sampling_period" in
+    low|mid|high) ;;
+    *) fail "период должен быть low, mid или high" ;;
+esac
+
+target=("$@")
+enrich_script="${project_dir}/scripts/enrich_sass.py"
+raw_folded="${output_prefix}.folded"
+profiler_stderr="${output_prefix}.stderr"
+sass_folded="${output_prefix}_sass.folded"
+sass_stderr="${output_prefix}_sass.stderr"
+svg_output="${output_prefix}.svg"
+
+[[ -f "$cuprof_path" ]] || fail "не найден cuprof: $cuprof_path"
+[[ -x "$cuprof_path" ]] || fail "cuprof нельзя запустить: $cuprof_path"
+[[ -f "${target[0]}" ]] || fail "не найдена программа: ${target[0]}"
+[[ -x "${target[0]}" ]] || fail "программу нельзя запустить: ${target[0]}"
+[[ -f "$enrich_script" ]] || fail "не найден enrich_sass.py: $enrich_script"
+command -v "$python_path" >/dev/null 2>&1 || fail "не найден Python: $python_path"
+if [[ -n "$flamegraph_path" ]]; then
+    [[ -f "$flamegraph_path" ]] || fail "не найден flamegraph.pl: $flamegraph_path"
+    [[ -x "$flamegraph_path" ]] || fail "flamegraph.pl нельзя запустить: $flamegraph_path"
+fi
+
+output_dir="$(dirname "$output_prefix")"
+mkdir -p "$output_dir" || fail "не удалось создать папку: $output_dir"
+
+# Эти файлы относятся к raw-профилю. Старые версии нельзя оставлять рядом с
+# новым запуском: при ошибке SASS или FlameGraph их можно принять за свежие.
+rm -f -- "$sass_folded" "$sass_stderr" "$svg_output" || \
+    fail "не удалось удалить старые результаты"
+
+collection_command=(
+    "$cuprof_path"
+    --stall-mode
+    --sampling-period "$sampling_period"
+    "${target[@]}"
+)
+if ! "${collection_command[@]}" >"$raw_folded" 2>"$profiler_stderr"; then
+    fail "не удалось снять профиль. Подробности: $profiler_stderr"
+fi
+[[ -s "$raw_folded" ]] || fail "получился пустой raw-файл: $raw_folded"
+[[ -s "$profiler_stderr" ]] || fail "нет статистики профайлера: $profiler_stderr"
+
+sass_command=(
+    "$python_path" "$enrich_script"
+    --input "$raw_folded"
+    --binary "${target[0]}"
+    --arch "$architecture"
+    --output "$sass_folded"
+)
+if ! "${sass_command[@]}" >/dev/null 2>"$sass_stderr"; then
+    fail "не удалось добавить SASS. Raw-файл сохранён: $raw_folded"
+fi
+[[ -s "$sass_folded" ]] || fail "получился пустой SASS-файл: $sass_folded"
+[[ -s "$sass_stderr" ]] || fail "нет статистики SASS: $sass_stderr"
+
+if [[ -n "$flamegraph_path" ]]; then
+    flamegraph_command=("$flamegraph_path" --hash "$sass_folded")
+    if ! "${flamegraph_command[@]}" >"$svg_output"; then
+        fail "не удалось сделать SVG. Folded-файлы сохранены"
+    fi
+    [[ -s "$svg_output" ]] || fail "получился пустой SVG: $svg_output"
+fi
+
+printf '%s\n' "Готово:" "  raw:  $raw_folded" "  SASS: $sass_folded"
+if [[ -n "$flamegraph_path" ]]; then
+    printf '  SVG:  %s\n' "$svg_output"
+fi

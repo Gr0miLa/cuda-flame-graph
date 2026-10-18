@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 
-"""Build an exact SASS instruction index from cuobjdump output.
-
-Folded-stack enrichment is intentionally not implemented in this stage.
-"""
+"""Build an exact SASS index and enrich folded PC-sampling stacks."""
 
 from __future__ import annotations
 
@@ -23,6 +20,8 @@ INSTRUCTION_RE = re.compile(
     r"(?:@!?[A-Za-z0-9_.]+\s+)?"
     r"([A-Za-z][A-Za-z0-9_.]*)\b"
 )
+PC_FRAME_RE = re.compile(r"^0x([0-9a-f]+)$")
+WEIGHT_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 class SassError(RuntimeError):
@@ -35,6 +34,10 @@ class SassParseError(SassError):
 
 class ToolExecutionError(SassError):
     """Raised when an external CUDA binary utility cannot be executed."""
+
+
+class FoldedParseError(SassError):
+    """Raised when a folded row cannot be enriched safely."""
 
 
 @dataclass
@@ -51,6 +54,27 @@ class Resolution:
     status: str
     mnemonic: str | None = None
     matched_function: str | None = None
+
+
+@dataclass(frozen=True)
+class FoldedRow:
+    frames: tuple[str, ...]
+    weight: int
+    pc_offset: int
+
+
+@dataclass
+class EnrichmentStats:
+    rows_read: int = 0
+    total_weight: int = 0
+    resolved_rows: int = 0
+    resolved_weight: int = 0
+    unresolved_rows: int = 0
+    unresolved_weight: int = 0
+    ambiguous_functions: int = 0
+    architecture_mismatches: int = 0
+    malformed_rows: int = 0
+    unique_kernel_pc_pairs: set[tuple[str, int]] = field(default_factory=set)
 
 
 class SassIndex:
@@ -232,6 +256,134 @@ def build_sass_index(
     return apply_demangled_names(index, demangle_function_names(names, demangler))
 
 
+def parse_folded_line(line: str, line_number: int) -> FoldedRow:
+    stripped = line.rstrip("\r\n")
+    if not stripped:
+        raise FoldedParseError(f"line {line_number}: empty folded row")
+    try:
+        stack, weight_text = stripped.rsplit(maxsplit=1)
+    except ValueError as error:
+        raise FoldedParseError(
+            f"line {line_number}: missing stack or weight"
+        ) from error
+    if not WEIGHT_RE.fullmatch(weight_text):
+        raise FoldedParseError(
+            f"line {line_number}: weight must be a positive decimal integer"
+        )
+
+    frames = tuple(stack.split(";"))
+    if len(frames) < 3 or any(not frame for frame in frames):
+        raise FoldedParseError(
+            f"line {line_number}: expected non-empty kernel;stall;PC tail"
+        )
+    pc_match = PC_FRAME_RE.fullmatch(frames[-1])
+    if pc_match is None:
+        raise FoldedParseError(
+            f"line {line_number}: last frame must be lowercase hexadecimal PC"
+        )
+    return FoldedRow(frames, int(weight_text, 10), int(pc_match.group(1), 16))
+
+
+def enrich_folded_lines(
+    lines: Iterable[str], index: SassIndex, architecture: str
+) -> tuple[list[str], EnrichmentStats]:
+    if architecture not in index.architectures:
+        available = ", ".join(index.architectures) or "none"
+        raise SassError(
+            f"architecture {architecture} is absent; available: {available}"
+        )
+
+    output: list[str] = []
+    stats = EnrichmentStats()
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            row = parse_folded_line(line, line_number)
+        except FoldedParseError:
+            stats.malformed_rows += 1
+            raise
+
+        kernel = row.frames[-3]
+        resolution = index.resolve(architecture, kernel, row.pc_offset)
+
+        # A second pass would otherwise interpret the mnemonic as the kernel.
+        if resolution.status == "unknown_function" and len(row.frames) >= 4:
+            previous = index.resolve(architecture, row.frames[-4], row.pc_offset)
+            if previous.status == "resolved" and previous.mnemonic == kernel:
+                raise FoldedParseError(
+                    f"line {line_number}: input appears to be already enriched"
+                )
+
+        stats.rows_read += 1
+        stats.total_weight += row.weight
+        stats.unique_kernel_pc_pairs.add((kernel, row.pc_offset))
+        if resolution.status == "resolved":
+            frames = row.frames[:-2] + (resolution.mnemonic,) + row.frames[-2:]
+            stats.resolved_rows += 1
+            stats.resolved_weight += row.weight
+        else:
+            frames = row.frames
+            stats.unresolved_rows += 1
+            stats.unresolved_weight += row.weight
+            if resolution.status == "ambiguous_function":
+                stats.ambiguous_functions += 1
+            elif resolution.status == "unknown_architecture":
+                stats.architecture_mismatches += 1
+        output.append(f"{';'.join(frames)} {row.weight}\n")
+
+    if stats.resolved_rows + stats.unresolved_rows != stats.rows_read:
+        raise SassError("internal error: folded row accounting mismatch")
+    if stats.resolved_weight + stats.unresolved_weight != stats.total_weight:
+        raise SassError("internal error: folded weight accounting mismatch")
+    return output, stats
+
+
+def enrich_folded_file(
+    input_path: Path, output_path: Path, index: SassIndex, architecture: str
+) -> EnrichmentStats:
+    if input_path.resolve() == output_path.resolve():
+        raise SassError("input and output paths must be different")
+    if not input_path.is_file():
+        raise SassError(f"folded input does not exist: {input_path}")
+
+    lines = input_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    enriched, stats = enrich_folded_lines(lines, index, architecture)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("".join(enriched), encoding="utf-8")
+    return stats
+
+
+def print_enrichment_stats(stats: EnrichmentStats) -> None:
+    row_percent = (
+        100.0 * stats.resolved_rows / stats.rows_read if stats.rows_read else 0.0
+    )
+    weight_percent = (
+        100.0 * stats.resolved_weight / stats.total_weight
+        if stats.total_weight
+        else 0.0
+    )
+    print(f"rows read: {stats.rows_read}", file=sys.stderr)
+    print(
+        f"unique kernel/PC pairs: {len(stats.unique_kernel_pc_pairs)}",
+        file=sys.stderr,
+    )
+    print(
+        f"resolved: rows={stats.resolved_rows}, weight={stats.resolved_weight}",
+        file=sys.stderr,
+    )
+    print(
+        f"unresolved: rows={stats.unresolved_rows}, weight={stats.unresolved_weight}",
+        file=sys.stderr,
+    )
+    print(f"ambiguous functions: {stats.ambiguous_functions}", file=sys.stderr)
+    print(
+        f"architecture mismatches: {stats.architecture_mismatches}",
+        file=sys.stderr,
+    )
+    print(f"malformed rows: {stats.malformed_rows}", file=sys.stderr)
+    print(f"resolution by rows: {row_percent:.3f}%", file=sys.stderr)
+    print(f"resolution by weight: {weight_percent:.3f}%", file=sys.stderr)
+
+
 def _parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build and inspect an exact SASS index from a CUDA binary."
@@ -240,6 +392,8 @@ def _parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--arch", required=True, help="CUDA architecture, e.g. sm_75")
     parser.add_argument("--cuobjdump", default="cuobjdump")
     parser.add_argument("--demangler", default="cu++filt")
+    parser.add_argument("--input", type=Path, help="raw folded input")
+    parser.add_argument("--output", type=Path, help="enriched folded output")
     parser.add_argument(
         "--limit",
         type=int,
@@ -252,6 +406,8 @@ def _parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_arguments(sys.argv[1:] if argv is None else argv)
     try:
+        if (args.input is None) != (args.output is None):
+            raise SassError("--input and --output must be specified together")
         index = build_sass_index(args.binary, args.cuobjdump, args.demangler)
         functions = index.functions_for_architecture(args.arch)
         if not functions:
@@ -259,6 +415,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SassError(
                 f"architecture {args.arch} is absent; available: {available}"
             )
+        if args.input is not None:
+            stats = enrich_folded_file(args.input, args.output, index, args.arch)
+            print_enrichment_stats(stats)
+            return 0
     except SassError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
