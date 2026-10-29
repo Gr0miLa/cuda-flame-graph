@@ -1,2 +1,6 @@
 add_subdirectory(matrixMul)
 add_subdirectory(vectorAdd)
+add_subdirectory(relu)
+add_subdirectory(gelu)
+add_subdirectory(softmax)
+add_subdirectory(matrixCompare)
