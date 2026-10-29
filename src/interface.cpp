@@ -28,6 +28,7 @@ extern "C" {
         printf("  --stall-mode              Enable PC Sampling stall profiling (default: execution time)\n");
         printf("  --sampling-period <name>  Set PC Sampling period (default: low)\n");
         printf("                            Options: min, low, mid, high, max\n");
+        printf("  --sampling-period-exp <n> Set period to 2^n GPU cycles (n: 5..31)\n");
         printf("  --show-all-stalls         Show all stall reasons including STALL_NONE\n");
         printf("  -h, --help                Show this help message and exit\n");
         printf("\nProfiles:\n");
@@ -87,9 +88,26 @@ extern "C" {
                         exit(1);
                     }
                     setenv("PTI_SAMPLING_PERIOD", argv[i + 1], 1);
+                    unsetenv("PTI_SAMPLING_PERIOD_EXP");
                     i += 2;
                 } else {
                     fprintf(stderr, "Error: --sampling-period requires a value.\n");
+                    Usage();
+                    exit(1);
+                }
+            } else if (strcmp(arg, "--sampling-period-exp") == 0) {
+                if (i + 1 < argc) {
+                    char* end = nullptr;
+                    long exponent = std::strtol(argv[i + 1], &end, 10);
+                    if (end == argv[i + 1] || *end != '\0' ||
+                        exponent < 5 || exponent > 31) {
+                        fprintf(stderr, "Error: Sampling period exponent must be an integer from 5 to 31.\n");
+                        exit(1);
+                    }
+                    setenv("PTI_SAMPLING_PERIOD_EXP", argv[i + 1], 1);
+                    i += 2;
+                } else {
+                    fprintf(stderr, "Error: --sampling-period-exp requires a value.\n");
                     Usage();
                     exit(1);
                 }

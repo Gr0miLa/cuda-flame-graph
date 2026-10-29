@@ -123,6 +123,14 @@ void CudaProfiler::init() {
         }
     }
 
+    if (const char* exponent_env = std::getenv("PTI_SAMPLING_PERIOD_EXP")) {
+        char* end = nullptr;
+        const long exponent = std::strtol(exponent_env, &end, 10);
+        if (end != exponent_env && *end == '\0' && exponent >= 5 && exponent <= 31) {
+            config.sampling_period_exponent = static_cast<uint32_t>(exponent);
+        }
+    }
+
     stack_resolver.configure(config.filter_mask, config.debug);
 
     if (!config.stall_mode) {
@@ -271,6 +279,10 @@ void CudaProfiler::finalize() {
                 gpu_profiler->pc_sampling_records().size());
         fprintf(stderr, "PC Sampling period: %d\n",
                 static_cast<int>(gpu_profiler->sampling_period()));
+        if (config.sampling_period_exponent != 0) {
+            fprintf(stderr, "PC Sampling period exponent: %u\n",
+                    config.sampling_period_exponent);
+        }
         fprintf(stderr, "PC Sampling unmatched records: %lu\n", unmatched_pc_records);
 
         const uint64_t info_count = gpu_profiler->pc_sampling_record_info_count();

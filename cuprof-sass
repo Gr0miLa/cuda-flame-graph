@@ -6,6 +6,7 @@ set -o pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 output_prefix=""
 sampling_period="low"
+sampling_period_exponent=""
 architecture=""
 cuprof_path="${project_dir}/build/cuprof"
 flamegraph_path=""
@@ -19,7 +20,8 @@ usage() {
         "Опции:" \
         "  --output ПУТЬ            Имя и путь для результатов" \
         "  --arch АРХИТЕКТУРА       Например sm_75" \
-        "  --sampling-period ПЕРИОД low, mid или high (по умолчанию low)" \
+        "  --sampling-period ПЕРИОД min, low, mid, high или max (по умолчанию low)" \
+        "  --sampling-period-exp N  Точный период 2^N циклов, N от 5 до 31" \
         "  --cuprof ПУТЬ            Путь к cuprof (по умолчанию build/cuprof)" \
         "  --flamegraph ПУТЬ        Путь к flamegraph.pl, если нужен SVG" \
         "  -h, --help               Показать эту справку" \
@@ -56,6 +58,11 @@ while [[ $# -gt 0 ]]; do
             sampling_period="$2"
             shift 2
             ;;
+        --sampling-period-exp)
+            require_value "$@"
+            sampling_period_exponent="$2"
+            shift 2
+            ;;
         --cuprof)
             require_value "$@"
             cuprof_path="$2"
@@ -85,9 +92,14 @@ done
 [[ $# -gt 0 ]] || fail "после -- нужно указать CUDA-программу"
 
 case "$sampling_period" in
-    low|mid|high) ;;
-    *) fail "период должен быть low, mid или high" ;;
+    min|low|mid|high|max) ;;
+    *) fail "период должен быть min, low, mid, high или max" ;;
 esac
+if [[ -n "$sampling_period_exponent" ]] &&
+   { [[ ! "$sampling_period_exponent" =~ ^[0-9]+$ ]] ||
+     ((10#$sampling_period_exponent < 5 || 10#$sampling_period_exponent > 31)); }; then
+    fail "показатель периода должен быть целым числом от 5 до 31"
+fi
 
 target=("$@")
 enrich_script="${project_dir}/scripts/enrich_sass.py"
@@ -119,9 +131,13 @@ rm -f -- "$sass_folded" "$sass_stderr" "$svg_output" || \
 collection_command=(
     "$cuprof_path"
     --stall-mode
-    --sampling-period "$sampling_period"
-    "${target[@]}"
 )
+if [[ -n "$sampling_period_exponent" ]]; then
+    collection_command+=(--sampling-period-exp "$sampling_period_exponent")
+else
+    collection_command+=(--sampling-period "$sampling_period")
+fi
+collection_command+=("${target[@]}")
 if ! "${collection_command[@]}" >"$raw_folded" 2>"$profiler_stderr"; then
     fail "не удалось снять профиль. Подробности: $profiler_stderr"
 fi

@@ -44,8 +44,10 @@ bool GpuProfiler::start(const ProfilerConfig& config) {
     }
 
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL);
-    cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
-    cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
+    if (!config_.stall_mode) {
+        cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME);
+        cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
+    }
     cuptiActivityRegisterCallbacks(request_activity_buffer, complete_activity_buffer);
     return true;
 }
@@ -72,17 +74,24 @@ void GpuProfiler::stop() {
                     result);
         }
     }
-    const CUpti_ActivityKind activity_kinds[] = {
-        CUPTI_ACTIVITY_KIND_MEMCPY,
-        CUPTI_ACTIVITY_KIND_RUNTIME,
-        CUPTI_ACTIVITY_KIND_KERNEL,
-    };
-    for (const CUpti_ActivityKind kind : activity_kinds) {
-        result = cuptiActivityDisable(kind);
-        if (result != CUPTI_SUCCESS) {
-            fprintf(stderr, "Warning: disabling CUPTI activity %d failed (error %d)\n",
-                    static_cast<int>(kind), result);
+    if (!config_.stall_mode) {
+        const CUpti_ActivityKind non_stall_activity_kinds[] = {
+            CUPTI_ACTIVITY_KIND_MEMCPY,
+            CUPTI_ACTIVITY_KIND_RUNTIME,
+        };
+        for (const CUpti_ActivityKind kind : non_stall_activity_kinds) {
+            result = cuptiActivityDisable(kind);
+            if (result != CUPTI_SUCCESS) {
+                fprintf(stderr, "Warning: disabling CUPTI activity %d failed (error %d)\n",
+                        static_cast<int>(kind), result);
+            }
         }
+    }
+
+    result = cuptiActivityDisable(CUPTI_ACTIVITY_KIND_KERNEL);
+    if (result != CUPTI_SUCCESS) {
+        fprintf(stderr, "Warning: disabling CUPTI activity %d failed (error %d)\n",
+                static_cast<int>(CUPTI_ACTIVITY_KIND_KERNEL), result);
     }
 
     if (active_instance_ == this) active_instance_ = nullptr;
@@ -154,7 +163,7 @@ void GpuProfiler::setup_pc_sampling() {
     CUpti_ActivityPCSamplingConfig sampling_config{};
     sampling_config.size = sizeof(CUpti_ActivityPCSamplingConfig);
     sampling_config.samplingPeriod = config_.sampling_period;
-    sampling_config.samplingPeriod2 = 0;
+    sampling_config.samplingPeriod2 = config_.sampling_period_exponent;
 
     CUptiResult result = cuptiActivityConfigurePCSampling(context, &sampling_config);
     if (result != CUPTI_SUCCESS) {
@@ -172,8 +181,13 @@ void GpuProfiler::setup_pc_sampling() {
     }
 
     pc_sampling_enabled_ = true;
-    fprintf(stderr, "PC Sampling enabled (period: %d, CC %d.%d)\n",
-            static_cast<int>(config_.sampling_period), major, minor);
+    if (config_.sampling_period_exponent != 0) {
+        fprintf(stderr, "PC Sampling enabled (period: 2^%u cycles, CC %d.%d)\n",
+                config_.sampling_period_exponent, major, minor);
+    } else {
+        fprintf(stderr, "PC Sampling enabled (period: %d, CC %d.%d)\n",
+                static_cast<int>(config_.sampling_period), major, minor);
+    }
 }
 
 void GpuProfiler::add_gpu_sample(GpuSample sample) {
@@ -243,7 +257,7 @@ void CUPTIAPI GpuProfiler::runtime_callback(
 
 void CUPTIAPI GpuProfiler::request_activity_buffer(
     uint8_t** buffer, size_t* size, size_t* max_records) {
-    *size = 256 * 1024;
+    *size = 1024 * 1024;
     *buffer = static_cast<uint8_t*>(malloc(*size));
     *max_records = 0;
 }
