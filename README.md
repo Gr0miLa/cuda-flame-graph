@@ -49,24 +49,6 @@ CPU стек -> cudaLaunchKernel -> kernel -> SASS инструкция -> пр�
 
 Для CPU `perf_event` нужен `sudo`. Для stall mode `sudo` не нужен.
 
-## Сравнение периодов
-
-Запустить все собранные samples без профилировщика и со всеми пятью периодами:
-
-```bash
-scripts/run_sampling_experiment.sh \
-  --output results/experiment \
-  --arch sm_75 \
-  --repeats 5
-```
-
-Скрипт проверяет стандартные `min/low/mid/high/max` и промежуточные периоды
-`2^6`, `2^7`, `2^8`, `2^9`, `2^10`, `2^12`, `2^14`, `2^16`. Он сохраняет folded, SASS folded,
-stderr и SVG отдельно для каждого sample. В `summary.tsv` записываются медиана
-времени и замедление, а в `quality.tsv` — фактический период, число PC records,
-потери и число folded-строк. Папка для нового эксперимента должна быть пустой,
-чтобы результаты разных запусков не смешивались.
-
 ## Сборка
 ```bash
 mkdir -p build
@@ -211,3 +193,21 @@ python3 scripts/enrich_sass.py \
 cd build
 sudo ./cuprof -f 99 ./samples/matrixMul/matrixMul > nonstall.folded
 ```
+
+## Сравнение периодов
+
+Запустить все собранные samples без профилировщика и со всеми пятью периодами:
+
+```bash
+scripts/run_sampling_experiment.sh \
+  --output results/experiment \
+  --arch sm_75 \
+  --repeats 5
+```
+
+Скрипт проверяет стандартные `min/low/mid/high/max` и промежуточные периоды
+`2^6`, `2^7`, `2^8`, `2^9`, `2^10`, `2^12`, `2^14`, `2^16`. Он сохраняет folded, SASS folded,
+stderr и SVG отдельно для каждого sample. В `summary.tsv` записываются медиана
+времени и замедление, а в `quality.tsv` — фактический период, число PC records,
+потери и число folded-строк. Папка для нового эксперимента должна быть пустой,
+чтобы результаты разных запусков не смешивались.
