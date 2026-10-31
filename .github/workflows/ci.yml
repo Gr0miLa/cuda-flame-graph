@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check cuprof-sass
+        run: bash -n cuprof-sass
+
+      - name: Check experiment script
+        run: bash -n scripts/run_sampling_experiment.sh
+
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ make
+
+      - name: Configure
+        run: cmake -S . -B build -DPROFILER_SAMPLE_CUDA_ARCHITECTURES=75
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Check CUDA architecture
+        run: cuobjdump -lelf build/samples/matrixMul/matrixMul | grep "sm_75"
