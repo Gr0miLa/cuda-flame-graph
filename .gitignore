@@ -6,10 +6,7 @@ tests/
 
 *.so
 *.folded
-*.svg
 __pycache__/
 *.pyc
 
 temp.cpp
-
-!images/output.svg
