@@ -131,6 +131,24 @@ void CudaProfiler::init() {
         }
     }
 
+    if (const char* buffer_env = std::getenv("PTI_ACTIVITY_BUFFER_KB")) {
+        char* end = nullptr;
+        const long buffer_kb = std::strtol(buffer_env, &end, 10);
+
+        if (end != buffer_env && *end == '\0' &&
+            buffer_kb >= 64 && buffer_kb <= 65536) {
+            config.activity_buffer_size =
+                static_cast<size_t>(buffer_kb) * 1024;
+        } else {
+            fprintf(
+                stderr,
+                "Warning: Invalid activity buffer size '%s'. "
+                "Using default 1024 KB\n",
+                buffer_env
+            );
+        }
+    }
+
     stack_resolver.configure(config.filter_mask, config.debug);
 
     if (!config.stall_mode) {
@@ -304,6 +322,7 @@ void CudaProfiler::finalize() {
         }
     }
     
+    fprintf(stderr, "CUPTI activity buffer: %zu KB\n", config.activity_buffer_size / 1024);
     fprintf(stderr, "Filter profile: standard (APP + CUDA_API + SYSTEM)\n");
     fprintf(stderr, "===========================\n\n");
     

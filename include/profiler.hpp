@@ -29,6 +29,7 @@ struct ProfilerConfig {
     bool debug = false;
     CUpti_ActivityPCSamplingPeriod sampling_period = CUPTI_ACTIVITY_PC_SAMPLING_PERIOD_LOW;
     uint32_t sampling_period_exponent = 0;
+    size_t activity_buffer_size = 1024 * 1024;
 };
 
 struct GpuSample {

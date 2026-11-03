@@ -257,7 +257,7 @@ void CUPTIAPI GpuProfiler::runtime_callback(
 
 void CUPTIAPI GpuProfiler::request_activity_buffer(
     uint8_t** buffer, size_t* size, size_t* max_records) {
-    *size = 1024 * 1024;
+    *size = active_instance_->config_.activity_buffer_size;
     *buffer = static_cast<uint8_t*>(malloc(*size));
     *max_records = 0;
 }

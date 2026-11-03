@@ -29,6 +29,7 @@ extern "C" {
         printf("  --sampling-period <name>  Set PC Sampling period (default: low)\n");
         printf("                            Options: min, low, mid, high, max\n");
         printf("  --sampling-period-exp <n> Set period to 2^n GPU cycles (n: 5..31)\n");
+        printf("  --activity-buffer-kb <n>  Set CUPTI activity buffer size in KB (default: 1024)\n");
         printf("  --show-all-stalls         Show all stall reasons including STALL_NONE\n");
         printf("  -h, --help                Show this help message and exit\n");
         printf("\nProfiles:\n");
@@ -108,6 +109,30 @@ extern "C" {
                     i += 2;
                 } else {
                     fprintf(stderr, "Error: --sampling-period-exp requires a value.\n");
+                    Usage();
+                    exit(1);
+                }
+            } else if (strcmp(arg, "--activity-buffer-kb") == 0) {
+                if (i + 1 < argc) {
+                    char* end = nullptr;
+                    long buffer_kb = std::strtol(argv[i + 1], &end, 10);
+
+                    if (end == argv[i + 1] || *end != '\0' ||
+                        buffer_kb < 64 || buffer_kb > 65536) {
+                        fprintf(
+                            stderr,
+                            "Error: Activity buffer size must be from 64 to 65536 KB.\n"
+                        );
+                        exit(1);
+                    }
+
+                    setenv("PTI_ACTIVITY_BUFFER_KB", argv[i + 1], 1);
+                    i += 2;
+                } else {
+                    fprintf(
+                        stderr,
+                        "Error: --activity-buffer-kb requires a value.\n"
+                    );
                     Usage();
                     exit(1);
                 }
