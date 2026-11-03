@@ -28,3 +28,4 @@ target_include_directories(cuprof PRIVATE loader utils)
 target_link_libraries(cuprof PRIVATE pthread dl)
 
 add_subdirectory(samples)
+add_subdirectory(benchmarks)
